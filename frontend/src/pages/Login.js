@@ -1,58 +1,84 @@
 import React, { useState } from "react";
 import axios from "axios";
+import { useNavigate } from "react-router-dom";
 
 function Login() {
-  const [email, setEmail] = useState("");
-  const [password, setPassword] = useState("");
+    const navigate = useNavigate();
 
-  const handleLogin = async () => {
-    try {
-      const response = await axios.post(
-        "http://127.0.0.1:5000/login",
-        {
-          email,
-          password,
+    const [email, setEmail] = useState("");
+    const [password, setPassword] = useState("");
+
+    const handleLogin = async () => {
+        try {
+            const response = await axios.post(
+                "http://127.0.0.1:5000/login",
+                {
+                    email,
+                    password,
+                }
+            );
+
+            // Save JWT Token
+            localStorage.setItem(
+                "token",
+                response.data.token
+            );
+
+            alert("Login Successful");
+
+            // Get logged in user
+            const user = response.data.user;
+
+            // Check if career is selected
+            if (!user.targetCareer) {
+                navigate("/career-selection");
+            } else {
+                navigate("/profile-method");
+            }
+
+        } catch (error) {
+            alert(
+                error.response?.data?.message ||
+                "Login failed"
+            );
         }
-      );
+    };
 
-      localStorage.setItem(
-        "token",
-        response.data.token
-      );
+    return (
+        <div>
+            <h2>CareerCraft Login</h2>
 
-      alert("Login Successful");
-    } catch (error) {
-      alert(error.response.data.message);
-    }
-  };
+            <input
+                type="email"
+                placeholder="Email"
+                value={email}
+                onChange={(e) => setEmail(e.target.value)}
+            />
 
-  return (
-    <div>
-      <h2>CareerCraft Login</h2>
+            <br /><br />
 
-      <input
-        type="email"
-        placeholder="Email"
-        onChange={(e) => setEmail(e.target.value)}
-      />
+            <input
+                type="password"
+                placeholder="Password"
+                value={password}
+                onChange={(e) => setPassword(e.target.value)}
+            />
 
-      <br />
-      <br />
+            <br /><br />
 
-      <input
-        type="password"
-        placeholder="Password"
-        onChange={(e) => setPassword(e.target.value)}
-      />
+            <button onClick={handleLogin}>
+                Login
+            </button>
 
-      <br />
-      <br />
+            <br /><br />
 
-      <button onClick={handleLogin}>
-        Login
-      </button>
-    </div>
-  );
+            <p>Don't have an account?</p>
+
+            <button onClick={() => navigate("/register")}>
+                Register
+            </button>
+        </div>
+    );
 }
 
 export default Login;

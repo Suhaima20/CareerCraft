@@ -1,26 +1,75 @@
-# Python Virtual Environment
+# =========================
+# Python Backend
+# =========================
+
+# Virtual Environment
 venv/
 backend/venv/
+.venv/
 
 # Python Cache
 __pycache__/
-*.pyc
+*.py[cod]
+*$py.class
 
 # Environment Variables
 .env
+.env.*
 
-# React
+# Flask Instance / Logs
+instance/
+*.log
+
+
+# =========================
+# React Frontend
+# =========================
+
+# Node Modules
 node_modules/
+
+# Production Build
+build/
+dist/
+
+# React Environment Variables
+frontend/.env
+
+
+# =========================
+# CareerCraft Uploads
+# =========================
 
 # Resume Uploads
 backend/uploads/
 
-# Local PDF test files
+# Test Resume PDFs
 backend/*.pdf
+
+
+# =========================
+# Database / Local Files
+# =========================
+
+# MongoDB local files
+*.db
+*.sqlite3
+
+
+# =========================
+# IDE Settings
+# =========================
 
 # VS Code
 .vscode/
 
-# Operating System Files
+# PyCharm
+.idea/
+
+
+# =========================
+# OS Files
+# =========================
+
 .DS_Store
 Thumbs.db

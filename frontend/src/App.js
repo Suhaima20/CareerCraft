@@ -1,24 +1,36 @@
 import React from "react";
+import { BrowserRouter, Routes, Route } from "react-router-dom";
+
 import Register from "./pages/Register";
 import Login from "./pages/Login";
+import CareerSelection from "./pages/CareerSelection";
+import ProfileMethod from "./pages/ProfileMethod";
 import ResumeUpload from "./pages/ResumeUpload";
+import ManualSkillEntry from "./pages/ManualSkillEntry";
+import Dashboard from "./pages/Dashboard";
 
 function App() {
-  return (
-    <div style={{ padding: "30px" }}>
-      <h1>CareerCraft</h1>
+    return (
+        <BrowserRouter>
+            <Routes>
 
-      <Register />
+                <Route path="/" element={<Login />} />
 
-      <hr />
+                <Route path="/register" element={<Register />} />
 
-      <Login />
+                <Route path="/career-selection" element={<CareerSelection />} />
 
-      <hr />
+                <Route path="/profile-method" element={<ProfileMethod />} />
 
-      <ResumeUpload />
-    </div>
-  );
+                <Route path="/resume-upload" element={<ResumeUpload />} />
+
+                <Route path="/manual-skills" element={<ManualSkillEntry />} />
+
+                <Route path="/dashboard" element={<Dashboard />} />
+
+            </Routes>
+        </BrowserRouter>
+    );
 }
 
 export default App;
