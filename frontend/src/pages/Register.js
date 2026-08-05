@@ -3,80 +3,152 @@ import axios from "axios";
 import { useNavigate } from "react-router-dom";
 
 function Register() {
-  const [name, setName] = useState("");
-  const [email, setEmail] = useState("");
-  const [password, setPassword] = useState("");
-  const navigate = useNavigate();
 
-  const handleRegister = async () => {
-    try {
-      const response = await axios.post(
-        "http://127.0.0.1:5000/register",
-        {
-          name: name,
-          email: email,
-          password: password,
+    const navigate = useNavigate();
+
+    const [name, setName] = useState("");
+    const [email, setEmail] = useState("");
+    const [password, setPassword] = useState("");
+    const [loading, setLoading] = useState(false);
+
+    const handleRegister = async () => {
+
+        if (!name || !email || !password) {
+            alert("Please fill all the fields.");
+            return;
         }
-      );
 
-      alert("Registration successful! Please login.");
+        try {
 
-      // Clear fields after successful registration
-      setName("");
-      setEmail("");
-      setPassword("");
-      navigate("/");
+            setLoading(true);
 
-    } catch (error) {
-      console.log("Registration Error:", error);
+            // Register User
+            await axios.post(
+                "http://127.0.0.1:5000/register",
+                {
+                    name,
+                    email,
+                    password
+                }
+            );
 
-      if (error.response) {
-        alert(error.response.data.message);
-      } else {
-        alert("Cannot connect to backend server");
-      }
-    }
-  };
+            // Automatically Login
+            const loginResponse = await axios.post(
+                "http://127.0.0.1:5000/login",
+                {
+                    email,
+                    password
+                }
+            );
 
-  return (
-    <div style={{ marginBottom: "30px" }}>
-      <h2>CareerCraft Register</h2>
+            // Save JWT Token
+            localStorage.setItem(
+                "token",
+                loginResponse.data.token
+            );
 
-      <input
-        type="text"
-        placeholder="Name"
-        value={name}
-        onChange={(e) => setName(e.target.value)}
-      />
+            // Save User Details
+            localStorage.setItem(
+                "user",
+                JSON.stringify(loginResponse.data.user)
+            );
 
-      <br />
-      <br />
+            alert("Registration Successful!");
 
-      <input
-        type="email"
-        placeholder="Email"
-        value={email}
-        onChange={(e) => setEmail(e.target.value)}
-      />
+            navigate("/profile");
 
-      <br />
-      <br />
+        } catch (error) {
 
-      <input
-        type="password"
-        placeholder="Password"
-        value={password}
-        onChange={(e) => setPassword(e.target.value)}
-      />
+            console.log(error);
 
-      <br />
-      <br />
+            alert(
+                error.response?.data?.message ||
+                "Registration failed."
+            );
 
-      <button onClick={handleRegister}>
-        Register
-      </button>
-    </div>
-  );
+        } finally {
+
+            setLoading(false);
+
+        }
+
+    };
+
+    return (
+
+        <div style={{ textAlign: "center", marginTop: "50px" }}>
+
+            <h2>CareerCraft Register</h2>
+
+            <br />
+
+            <input
+                type="text"
+                placeholder="Full Name"
+                value={name}
+                onChange={(e) => setName(e.target.value)}
+                style={{
+                    width: "300px",
+                    padding: "10px"
+                }}
+            />
+
+            <br /><br />
+
+            <input
+                type="email"
+                placeholder="Email"
+                value={email}
+                onChange={(e) => setEmail(e.target.value)}
+                style={{
+                    width: "300px",
+                    padding: "10px"
+                }}
+            />
+
+            <br /><br />
+
+            <input
+                type="password"
+                placeholder="Password"
+                value={password}
+                onChange={(e) => setPassword(e.target.value)}
+                style={{
+                    width: "300px",
+                    padding: "10px"
+                }}
+            />
+
+            <br /><br />
+
+            <button
+                onClick={handleRegister}
+                disabled={loading}
+                style={{
+                    padding: "10px 25px",
+                    cursor: "pointer"
+                }}
+            >
+                {loading ? "Registering..." : "Register"}
+            </button>
+
+            <br /><br />
+
+            <p>Already have an account?</p>
+
+            <button
+                onClick={() => navigate("/")}
+                style={{
+                    padding: "10px 25px",
+                    cursor: "pointer"
+                }}
+            >
+                Login
+            </button>
+
+        </div>
+
+    );
 }
 
 export default Register;

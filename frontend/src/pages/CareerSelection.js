@@ -36,35 +36,55 @@ function CareerSelection() {
         }
 
         try {
+
             await selectCareer(selectedCareer);
 
-            alert("Career selected successfully!");
+            alert("Career selected successfully.");
 
             navigate("/profile-method");
 
         } catch (error) {
-            alert("Unable to save career.");
+
+            alert(
+                error.response?.data?.message ||
+                "Unable to save career."
+            );
+
         }
+
     };
 
     if (loading) {
-        return <h2>Loading careers...</h2>;
+        return (
+            <div style={{ textAlign: "center", marginTop: "80px" }}>
+                <h2>Loading careers...</h2>
+            </div>
+        );
     }
 
     return (
-        <div style={{ padding: "30px" }}>
 
-            <h1>Choose Your Dream Career</h1>
+        <div
+            style={{
+                width: "500px",
+                margin: "50px auto",
+                textAlign: "center"
+            }}
+        >
+
+            <h2>Select Your Career</h2>
 
             <p>
-                Select the career you want to pursue.
+                Choose the career you want CareerCraft to prepare you for.
             </p>
 
             <select
                 value={selectedCareer}
-                onChange={(e) =>
-                    setSelectedCareer(e.target.value)
-                }
+                onChange={(e) => setSelectedCareer(e.target.value)}
+                style={{
+                    width: "100%",
+                    padding: "10px"
+                }}
             >
                 <option value="">
                     -- Select Career --
@@ -80,14 +100,36 @@ function CareerSelection() {
                 ))}
             </select>
 
-            <br />
-            <br />
+            <br /><br />
 
-            <button onClick={handleContinue}>
-                Continue
-            </button>
+            <div
+                style={{
+                    display: "flex",
+                    justifyContent: "space-between"
+                }}
+            >
+                <button
+                    onClick={() => navigate(-1)}
+                    style={{
+                        padding: "10px 20px"
+                    }}
+                >
+                    ← Back
+                </button>
+
+                <button
+                    onClick={handleContinue}
+                    disabled={!selectedCareer}
+                    style={{
+                        padding: "10px 20px"
+                    }}
+                >
+                    Continue →
+                </button>
+            </div>
 
         </div>
+
     );
 }
 

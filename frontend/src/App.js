@@ -1,34 +1,77 @@
 import React from "react";
 import { BrowserRouter, Routes, Route } from "react-router-dom";
 
-import Register from "./pages/Register";
 import Login from "./pages/Login";
+import Register from "./pages/Register";
+import ProfilePage from "./pages/ProfilePage";
 import CareerSelection from "./pages/CareerSelection";
 import ProfileMethod from "./pages/ProfileMethod";
 import ResumeUpload from "./pages/ResumeUpload";
 import ManualSkillEntry from "./pages/ManualSkillEntry";
 import Dashboard from "./pages/Dashboard";
+import LearningRoadmap from "./pages/LearningRoadmap";
 
 function App() {
     return (
         <BrowserRouter>
+
             <Routes>
 
-                <Route path="/" element={<Login />} />
+                {/* Authentication */}
+                <Route
+                    path="/"
+                    element={<Login />}
+                />
 
-                <Route path="/register" element={<Register />} />
+                <Route
+                    path="/register"
+                    element={<Register />}
+                />
 
-                <Route path="/career-selection" element={<CareerSelection />} />
+                {/* Basic Profile */}
+                <Route
+                    path="/profile"
+                    element={<ProfilePage />}
+                />
 
-                <Route path="/profile-method" element={<ProfileMethod />} />
+                {/* Career Selection */}
+                <Route
+                    path="/career-selection"
+                    element={<CareerSelection />}
+                />
 
-                <Route path="/resume-upload" element={<ResumeUpload />} />
+                {/* Profile Method */}
+                <Route
+                    path="/profile-method"
+                    element={<ProfileMethod />}
+                />
 
-                <Route path="/manual-skills" element={<ManualSkillEntry />} />
+                {/* Resume Upload */}
+                <Route
+                    path="/resume-upload"
+                    element={<ResumeUpload />}
+                />
 
-                <Route path="/dashboard" element={<Dashboard />} />
+                {/* Manual Skills */}
+                <Route
+                    path="/manual-skills"
+                    element={<ManualSkillEntry />}
+                />
+
+                {/* Dashboard */}
+                <Route
+                    path="/dashboard"
+                    element={<Dashboard />}
+                />
+
+                {/* Learning Roadmap */}
+                <Route
+                    path="/roadmap"
+                    element={<LearningRoadmap />}
+                />
 
             </Routes>
+
         </BrowserRouter>
     );
 }
