@@ -1,99 +1,65 @@
-from flask import Flask
+import os
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+from flask import Flask, jsonify
 from flask_cors import CORS
-from flask_jwt_extended import JWTManager
-
-from config.config import Config
-from middleware.error_handler import register_error_handlers
-
-# Existing Blueprints
-from routes.auth import auth_bp
-from routes.resume import resume_bp
-from routes.career import career_bp
-from routes.user import user_bp
-from routes.roadmap import roadmap_bp
-from routes.progress import progress_bp
-
+from config import Config
 
 app = Flask(__name__)
+app.config.from_object(Config)
 
-# ==========================
-# Application Configuration
-# ==========================
+CORS(app, resources={r"/api/*": {"origins": [Config.FRONTEND_URL, "*"]}}, supports_credentials=True)
 
-app.config["SECRET_KEY"] = Config.SECRET_KEY
-app.config["JWT_SECRET_KEY"] = Config.JWT_SECRET_KEY
-app.config["MAX_CONTENT_LENGTH"] = Config.MAX_CONTENT_LENGTH
+os.makedirs(Config.UPLOAD_FOLDER, exist_ok=True)
 
-# ==========================
-# Enable CORS
-# ==========================
+from routes.auth import auth_bp
+from routes.users import users_bp
+from routes.careers import careers_bp
+from routes.skills import skills_bp
+from routes.resume import resume_bp
+from routes.analysis import analysis_bp
+from routes.roadmap import roadmap_bp
+from routes.achievements import achievements_bp
+from routes.notifications import notifications_bp
+from routes.jobs import jobs_bp
+from routes.market import market_bp
+from routes.resume_builder import resume_builder_bp
+from routes.feedback import feedback_bp
+from routes.admin import admin_bp
 
-CORS(app)
+app.register_blueprint(auth_bp, url_prefix="/api/auth")
+app.register_blueprint(users_bp, url_prefix="/api/users")
+app.register_blueprint(careers_bp, url_prefix="/api/careers")
+app.register_blueprint(skills_bp, url_prefix="/api/skills")
+app.register_blueprint(resume_bp, url_prefix="/api/resume")
+app.register_blueprint(analysis_bp, url_prefix="/api/analysis")
+app.register_blueprint(roadmap_bp, url_prefix="/api/roadmap")
+app.register_blueprint(achievements_bp, url_prefix="/api/achievements")
+app.register_blueprint(notifications_bp, url_prefix="/api/notifications")
+app.register_blueprint(jobs_bp, url_prefix="/api/jobs")
+app.register_blueprint(market_bp, url_prefix="/api/market")
+app.register_blueprint(resume_builder_bp, url_prefix="/api")
+app.register_blueprint(feedback_bp, url_prefix="/api")
+app.register_blueprint(admin_bp, url_prefix="/api/admin")
 
-# ==========================
-# JWT
-# ==========================
 
-jwt = JWTManager(app)
+@app.errorhandler(404)
+def not_found(e):
+    return jsonify({"error": "Endpoint not found"}), 404
 
-# ==========================
-# Global Error Handlers
-# ==========================
 
-register_error_handlers(app)
+@app.errorhandler(500)
+def server_error(e):
+    return jsonify({"error": "Internal server error"}), 500
 
-# ==========================
-# Register Blueprints
-# ==========================
 
-# Authentication
-app.register_blueprint(auth_bp)
+@app.route("/api/health", methods=["GET"])
+def health():
+    return jsonify({"status": "ok"}), 200
 
-# Resume Upload
-app.register_blueprint(
-    resume_bp,
-    url_prefix="/resume"
-)
-
-# Career
-app.register_blueprint(
-    career_bp,
-    url_prefix="/career"
-)
-
-# User
-app.register_blueprint(
-    user_bp,
-    url_prefix="/user"
-)
-
-# Roadmap
-app.register_blueprint(
-    roadmap_bp,
-    url_prefix="/roadmap"
-)
-
-# Progress
-app.register_blueprint(
-    progress_bp,
-    url_prefix="/progress"
-)
-
-# ==========================
-# Home Route
-# ==========================
-
-@app.route("/")
-def home():
-    return {
-        "success": True,
-        "message": "CareerCraft Backend Running",
-        "version": "1.0.0"
-    }
-
-# ==========================
-# Run Application
-# ==========================
 
 if __name__ == "__main__":
-    app.run(debug=(Config.FLASK_ENV == "development"))
+    port = int(os.environ.get("PORT", "5000"))
+    app.run(host="0.0.0.0", port=port, debug=(Config.FLASK_ENV == "development"))

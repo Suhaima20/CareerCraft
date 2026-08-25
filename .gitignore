@@ -1,75 +1,66 @@
 # =========================
-# Python Backend
+# Environment
 # =========================
-
-# Virtual Environment
-venv/
-backend/venv/
-.venv/
-
-# Python Cache
-__pycache__/
-*.py[cod]
-*$py.class
-
-# Environment Variables
 .env
 .env.*
+!.env.example
 
-# Flask Instance / Logs
-instance/
+# =========================
+# Logs
+# =========================
+logs
 *.log
-
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+lerna-debug.log*
 
 # =========================
-# React Frontend
+# Node / Vite
 # =========================
-
-# Node Modules
 node_modules/
-
-# Production Build
-build/
 dist/
-
-# React Environment Variables
-frontend/.env
-
+dist-ssr/
+*.local
 
 # =========================
-# CareerCraft Uploads
+# Python
 # =========================
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
 
-# Resume Uploads
+# Python virtual environment
+venv/
+.venv/
+env/
+backend/venv/
+
+# =========================
+# Uploaded files
+# =========================
 backend/uploads/
 
-# Test Resume PDFs
-backend/*.pdf
-
-
 # =========================
-# Database / Local Files
+# IDE
 # =========================
-
-# MongoDB local files
-*.db
-*.sqlite3
-
-
-# =========================
-# IDE Settings
-# =========================
-
-# VS Code
-.vscode/
-
-# PyCharm
+.vscode/*
+!.vscode/extensions.json
 .idea/
 
-
 # =========================
-# OS Files
+# OS
 # =========================
-
 .DS_Store
 Thumbs.db
+
+# =========================
+# Visual Studio
+# =========================
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?

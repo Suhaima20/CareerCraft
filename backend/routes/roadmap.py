@@ -1,390 +1,460 @@
-from flask import Blueprint
-from database.db import db
-from flask_jwt_extended import jwt_required, get_jwt_identity
-from models.user import User
+from flask import Blueprint, request, jsonify, g
+from datetime import datetime, timezone
 
+from db import get_collection
+from utils.auth import token_required
+from utils.serialization import to_objectid
 
-roadmap_bp = Blueprint(
-    "roadmap",
-    __name__
+from services.roadmap import (
+    build_roadmap,
+    build_brush_up,
 )
 
+from services.achievements import (
+    check_achievements,
+)
+
+from services.streak import update_streak
 
 
-# ==============================
-# Convert MongoDB ObjectId
-# ==============================
-
-def convert_object_id(document):
-
-    if document and "_id" in document:
-
-        document["_id"] = str(
-            document["_id"]
-        )
-
-    return document
+roadmap_bp = Blueprint("roadmap", __name__)
 
 
+# ============================================================
+# GET ROADMAP
+# ============================================================
 
+@roadmap_bp.route("/<career_id>", methods=["GET"])
+@token_required
+def get_roadmap(career_id):
 
-
-# ==============================
-# Generate Roadmap Function
-# ==============================
-
-def generate_roadmap(career_id):
-
-
-    career = db.careers.find_one(
-        {
-            "Career ID": career_id
-        }
+    roadmap = build_roadmap(
+        g.current_user_id,
+        career_id
     )
 
+    if roadmap is None:
+
+        return jsonify({
+            "error": "Career not found"
+        }), 404
+
+    return jsonify(roadmap), 200
 
 
-    if not career:
+# ============================================================
+# GET ROADMAP PROGRESS
+# ============================================================
 
-        return None
+@roadmap_bp.route("/<career_id>/progress", methods=["GET"])
+@token_required
+def get_progress(career_id):
 
-
-
-
-    roadmap = {
-
-        "career": convert_object_id(career),
-
-        "skills": []
-
-    }
-
-
-
-
-
-    career_skill_mapping = db.career_skill_mapping.find(
-
-        {
-            "Career ID": career_id
-        }
-
-    ).sort(
-
-        "Skill order",
-        1
-
+    roadmap = build_roadmap(
+        g.current_user_id,
+        career_id
     )
 
+    if roadmap is None:
+
+        return jsonify({
+            "error": "Career not found"
+        }), 404
+
+    return jsonify({
+
+        "completedChapters":
+            roadmap["completedChapters"],
+
+        "totalChapters":
+            roadmap["totalChapters"],
+
+        "progress":
+            roadmap["progress"],
+
+    }), 200
 
 
+# ============================================================
+# TOGGLE ROADMAP CHAPTER
+# ============================================================
+
+@roadmap_bp.route(
+    "/<career_id>/progress",
+    methods=["PUT"]
+)
+@token_required
+def toggle_chapter(career_id):
+
+    data = request.get_json() or {}
+
+    chapter_id = data.get("chapterId")
+    completed = data.get("completed")
+
+    # --------------------------------------------------------
+    # VALIDATION
+    # --------------------------------------------------------
+
+    if not chapter_id or completed is None:
+
+        return jsonify({
+            "error":
+                "chapterId and completed are required"
+        }), 400
 
 
-    for mapping in career_skill_mapping:
+    career_obj_id = to_objectid(career_id)
+    chapter_obj_id = to_objectid(chapter_id)
+
+    if (
+        career_obj_id is None
+        or chapter_obj_id is None
+    ):
+
+        return jsonify({
+            "error": "Invalid ID"
+        }), 400
 
 
-        skill_id = mapping["Skill ID"]
+    # --------------------------------------------------------
+    # SAVE PROGRESS
+    # --------------------------------------------------------
+
+    progress_collection = get_collection(
+        "roadmap_progress"
+    )
+
+    now = datetime.now(timezone.utc)
 
 
+    existing = progress_collection.find_one({
+
+        "userId":
+            g.current_user_id,
+
+        "careerId":
+            career_obj_id,
+
+        "chapterId":
+            chapter_obj_id,
+
+        "isBrushUp":
+            {"$ne": True},
+
+    })
 
 
-        skill = db.skills.find_one(
+    if existing:
+
+        progress_collection.update_one(
 
             {
-                "Skill ID": skill_id
-            }
+                "_id":
+                    existing["_id"]
+            },
 
-        )
+            {
+                "$set": {
 
+                    "completed":
+                        bool(completed),
 
+                    "updatedAt":
+                        now,
 
-
-        if skill:
-
-
-
-            skill_data = {
-
-                "skill": convert_object_id(skill),
-
-                "chapters":[]
-
-            }
-
-
-
-
-
-            skill_chapters = db.skill_chapter_mapping.find(
-
-                {
-                    "Skill ID": skill_id
                 }
-
-            ).sort(
-
-                "Chapter order",
-                1
-
-            )
-
-
-
-
-
-
-            for chapter_mapping in skill_chapters:
-
-
-
-                chapter_id = chapter_mapping["Chapter ID"]
-
-
-
-
-                chapter = db.chapters.find_one(
-
-                    {
-                        "Chapter ID": chapter_id
-                    }
-
-                )
-
-
-
-
-                if chapter:
-
-
-                    skill_data["chapters"].append(
-
-                        convert_object_id(chapter)
-
-                    )
-
-
-
-
-
-            roadmap["skills"].append(
-
-                skill_data
-
-            )
-
-
-
-
-
-
-    return roadmap
-
-
-
-
-
-
-
-# ==============================
-# Career ID Roadmap
-# Example:
-# /roadmap/CA001
-# ==============================
-
-
-@roadmap_bp.route(
-    "/<career_id>",
-    methods=["GET"]
-)
-def get_learning_roadmap(career_id):
-
-
-    try:
-
-
-        roadmap = generate_roadmap(
-            career_id
+            }
         )
 
+    else:
+
+        progress_collection.insert_one({
+
+            "userId":
+                g.current_user_id,
+
+            "careerId":
+                career_obj_id,
+
+            "chapterId":
+                chapter_obj_id,
+
+            "completed":
+                bool(completed),
+
+            "isBrushUp":
+                False,
+
+            "createdAt":
+                now,
+
+            "updatedAt":
+                now,
+
+        })
 
 
-        if not roadmap:
+    # --------------------------------------------------------
+    # UPDATE STREAK
+    # --------------------------------------------------------
+
+    update_streak(
+        g.current_user_id
+    )
 
 
-            return {
+    # --------------------------------------------------------
+    # CHECK ACHIEVEMENTS
+    #
+    # IMPORTANT:
+    # Only normal roadmap chapters count.
+    # Brush-up chapters do NOT count.
+    # --------------------------------------------------------
 
-                "message":
-                "Career not found"
+    newly_unlocked = []
 
-            },404
+    if completed:
+
+        achievement_result = check_achievements(
+
+            g.current_user_id,
+
+            career_obj_id
+
+        )
+
+        # New version of check_achievements()
+        # returns a dictionary.
+
+        if isinstance(
+            achievement_result,
+            dict
+        ):
+
+            newly_unlocked = (
+                achievement_result
+                .get("newlyUnlocked", [])
+            )
+
+        # Backward compatibility
+        elif isinstance(
+            achievement_result,
+            list
+        ):
+
+            newly_unlocked = (
+                achievement_result
+            )
 
 
+    # --------------------------------------------------------
+    # REBUILD ROADMAP
+    #
+    # This gives the frontend the latest percentage.
+    # --------------------------------------------------------
+
+    roadmap = build_roadmap(
+
+        g.current_user_id,
+
+        career_id
+
+    )
 
 
-        return roadmap,200
+    if roadmap is None:
 
-
-
-
-
-    except Exception as e:
-
-
-
-        return {
-
-            "message":
-            "Error generating roadmap",
-
+        return jsonify({
             "error":
-            str(e)
-
-        },500
-
+                "Career not found"
+        }), 404
 
 
+    # --------------------------------------------------------
+    # RESPONSE
+    # --------------------------------------------------------
+
+    return jsonify({
+
+        "completed":
+            bool(completed),
+
+        "completedChapters":
+            roadmap[
+                "completedChapters"
+            ],
+
+        "totalChapters":
+            roadmap[
+                "totalChapters"
+            ],
+
+        "progress":
+            roadmap[
+                "progress"
+            ],
+
+        "newlyUnlockedAchievements":
+            newly_unlocked,
+
+    }), 200
 
 
-
-
-# ==============================
-# Logged User Roadmap
-# ==============================
+# ============================================================
+# GET BRUSH-UP
+# ============================================================
 
 @roadmap_bp.route(
-    "/user",
+    "/<career_id>/brush-up",
     methods=["GET"]
 )
+@token_required
+def get_brush_up(career_id):
 
-@jwt_required()
+    chapters = build_brush_up(
 
-def get_user_roadmap():
+        g.current_user_id,
 
+        career_id
 
-    try:
+    )
 
-
-
-        email = get_jwt_identity()
-
-
-
-        user = User.find_by_email(
-            email
-        )
+    return jsonify({
+        "chapters": chapters
+    }), 200
 
 
+# ============================================================
+# TOGGLE BRUSH-UP CHAPTER
+# ============================================================
+
+@roadmap_bp.route(
+    "/<career_id>/brush-up",
+    methods=["PUT"]
+)
+@token_required
+def toggle_brush_up(career_id):
+
+    data = request.get_json() or {}
+
+    chapter_id = data.get("chapterId")
+    completed = data.get("completed")
+
+    # --------------------------------------------------------
+    # VALIDATION
+    # --------------------------------------------------------
+
+    if not chapter_id or completed is None:
+
+        return jsonify({
+            "error":
+                "chapterId and completed are required"
+        }), 400
 
 
-        if not user:
+    career_obj_id = to_objectid(
+        career_id
+    )
+
+    chapter_obj_id = to_objectid(
+        chapter_id
+    )
 
 
-            return {
+    if (
+        career_obj_id is None
+        or chapter_obj_id is None
+    ):
 
-                "message":
-                "User not found"
-
-            },404
-
-
-
-
-
-        active_career = user.get(
-            "activeCareer"
-        )
+        return jsonify({
+            "error": "Invalid ID"
+        }), 400
 
 
+    # --------------------------------------------------------
+    # SAVE BRUSH-UP PROGRESS
+    # --------------------------------------------------------
+
+    progress_collection = get_collection(
+        "roadmap_progress"
+    )
+
+    now = datetime.now(
+        timezone.utc
+    )
 
 
-        if not active_career:
+    existing = progress_collection.find_one({
+
+        "userId":
+            g.current_user_id,
+
+        "careerId":
+            career_obj_id,
+
+        "chapterId":
+            chapter_obj_id,
+
+        "isBrushUp":
+            True,
+
+    })
 
 
-            return {
+    if existing:
 
-                "message":
-                "No active career selected"
-
-            },400
-
-
-
-
-
-
-        career = db.careers.find_one(
+        progress_collection.update_one(
 
             {
-                "Career name":
-                active_career
+                "_id":
+                    existing["_id"]
+            },
+
+            {
+                "$set": {
+
+                    "completed":
+                        bool(completed),
+
+                    "updatedAt":
+                        now,
+
+                }
             }
 
         )
 
+    else:
+
+        progress_collection.insert_one({
+
+            "userId":
+                g.current_user_id,
+
+            "careerId":
+                career_obj_id,
+
+            "chapterId":
+                chapter_obj_id,
+
+            "completed":
+                bool(completed),
+
+            "isBrushUp":
+                True,
+
+            "createdAt":
+                now,
+
+            "updatedAt":
+                now,
+
+        })
 
 
+    return jsonify({
 
+        "completed":
+            bool(completed)
 
-        if not career:
-
-
-            return {
-
-                "message":
-                "Career roadmap not found"
-
-            },404
-
-
-
-
-
-
-        roadmap = generate_roadmap(
-
-            career["Career ID"]
-
-        )
-
-
-
-
-        return roadmap,200
-
-
-
-
-
-    except Exception as e:
-
-
-        return {
-
-            "message":
-            "Error loading user roadmap",
-
-            "error":
-            str(e)
-
-        },500
-
-
-
-
-
-
-
-# ==============================
-# My Roadmap Alias
-# ==============================
-
-@roadmap_bp.route(
-    "/my-roadmap",
-    methods=["GET"]
-)
-
-@jwt_required()
-
-def my_roadmap():
-
-    return get_user_roadmap()
+    }), 200
