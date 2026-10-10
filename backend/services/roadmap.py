@@ -1,753 +1,420 @@
+from bson import ObjectId
+
 from db import get_collection
 from utils.serialization import to_objectid
 
 
-def build_roadmap(user_id, career_id):
-    careers = get_collection("careers")
-    skills_collection = get_collection("skills")
-    mapping_collection = get_collection("career_skill_mapping")
-    chapters_collection = get_collection("chapters")
-    skill_chapter_collection = get_collection("skill_chapter_mapping")
-    progress_collection = get_collection("roadmap_progress")
+def get_value(document, *keys):
+    """Return the first non-empty value from a document."""
+    for key in keys:
+        value = document.get(key)
+        if value is not None and value != "":
+            return value
+    return None
 
-    # ---------------------------------------------------------
-    # Find career
-    # ---------------------------------------------------------
 
-    career_obj_id = to_objectid(career_id)
+def get_career_code(career):
+    return get_value(career, "career_id", "Career ID", "careerId")
 
-    if career_obj_id is None:
+
+def get_skill_code(skill):
+    return get_value(skill, "skill_id", "Skill ID", "skillCode")
+
+
+def get_chapter_code(chapter):
+    return get_value(chapter, "chapter_id", "Chapter ID")
+
+
+def convert_object_id(value):
+    """Safely convert a value to ObjectId when possible."""
+    if isinstance(value, ObjectId):
+        return value
+    if value is None:
         return None
+    return to_objectid(str(value))
 
-    career = careers.find_one({"_id": career_obj_id})
 
-    if career is None:
-        return None
+def get_career_skill_mappings(career):
+    """Support ObjectId-based and legacy code-based mappings."""
+    collection = get_collection("career_skill_mapping")
+    conditions = []
 
-    career_code = (
-        career.get("career_id")
-        or career.get("Career ID")
-        or career.get("careerId")
-    )
+    if career.get("_id") is not None:
+        conditions.append({"careerId": career["_id"]})
 
-    # ---------------------------------------------------------
-    # Find career -> skill mappings
-    # ---------------------------------------------------------
-
-    career_mapping_query = {
-        "$or": [
+    career_code = get_career_code(career)
+    if career_code:
+        conditions.extend([
             {"career_id": career_code},
             {"Career ID": career_code},
             {"careerId": career_code},
-        ]
-    }
+        ])
 
-    mappings = list(
-        mapping_collection.find(career_mapping_query).sort(
-            [
-                ("order", 1),
-                ("Skill order", 1),
-            ]
-        )
+    if not conditions:
+        return []
+
+    return list(
+        collection.find({"$or": conditions}).sort([
+            ("order", 1),
+            ("Skill order", 1),
+        ])
     )
 
-    skill_codes = []
+
+def resolve_skills(mappings):
+    """Resolve mapped skills in the order specified by the mappings."""
+    collection = get_collection("skills")
+    ordered_skills = []
+    seen_ids = set()
 
     for mapping in mappings:
-        skill_code = (
-            mapping.get("skill_id")
-            or mapping.get("Skill ID")
-            or mapping.get("skillId")
+        reference = get_value(
+            mapping,
+            "skillId",
+            "skill_id",
+            "Skill ID",
+            "skillCode",
         )
 
-        if skill_code:
-            skill_codes.append(str(skill_code))
+        if reference is None:
+            continue
 
-    # ---------------------------------------------------------
-    # Find skills
-    # ---------------------------------------------------------
+        skill = None
+        object_id = convert_object_id(reference)
 
-    if skill_codes:
-        skills = list(
-            skills_collection.find({
+        if object_id is not None:
+            skill = collection.find_one({"_id": object_id})
+
+        if skill is None:
+            code = str(reference)
+            skill = collection.find_one({
                 "$or": [
-                    {"skill_id": {"$in": skill_codes}},
-                    {"Skill ID": {"$in": skill_codes}},
-                    {"skillCode": {"$in": skill_codes}},
+                    {"skill_id": code},
+                    {"Skill ID": code},
+                    {"skillCode": code},
                 ]
             })
-        )
-    else:
-        skills = []
 
-    # ---------------------------------------------------------
-    # Preserve career -> skill order
-    # ---------------------------------------------------------
+        if skill is None:
+            continue
 
-    skill_map = {}
+        skill_id = str(skill["_id"])
+        if skill_id not in seen_ids:
+            seen_ids.add(skill_id)
+            ordered_skills.append(skill)
 
-    for skill in skills:
-        code = (
-            skill.get("skill_id")
-            or skill.get("Skill ID")
-            or skill.get("skillCode")
-        )
+    return ordered_skills
 
-        if code:
-            skill_map[str(code)] = skill
 
-    ordered_skills = [
-        skill_map[code]
-        for code in skill_codes
-        if code in skill_map
-    ]
+def get_skill_chapter_mappings(skill):
+    """Find chapters associated with a skill using either schema."""
+    collection = get_collection("skill_chapter_mapping")
+    conditions = []
 
-    # ---------------------------------------------------------
-    # Get user's confirmed skills
-    # ---------------------------------------------------------
+    if skill.get("_id") is not None:
+        conditions.append({"skillId": skill["_id"]})
 
-    user_skills_doc = get_collection("user_skills").find_one({
-        "userId": user_id
-    })
+    skill_code = get_skill_code(skill)
+    if skill_code:
+        conditions.extend([
+            {"skill_id": skill_code},
+            {"Skill ID": skill_code},
+            {"skillId": skill_code},
+        ])
 
-    user_skill_ids = set()
-    user_skill_codes = set()
+    if not conditions:
+        return []
 
-    if user_skills_doc:
-
-        for entry in user_skills_doc.get("skills", []):
-
-            if not isinstance(entry, dict):
-                continue
-
-            # ObjectId based skill
-            skill_id = entry.get("skillId")
-
-            if skill_id:
-                user_skill_ids.add(str(skill_id))
-
-            # Code based skill
-            skill_code = (
-                entry.get("skill_id")
-                or entry.get("Skill ID")
-                or entry.get("skillCode")
-            )
-
-            if skill_code:
-                user_skill_codes.add(str(skill_code))
-
-    # ---------------------------------------------------------
-    # Separate known and missing skills
-    # ---------------------------------------------------------
-
-    missing_skills = []
-    known_skills = []
-
-    for skill in ordered_skills:
-
-        skill_object_id = str(skill["_id"])
-
-        skill_code = str(
-            skill.get("skill_id")
-            or skill.get("Skill ID")
-            or skill.get("skillCode")
-            or ""
-        )
-
-        if (
-            skill_object_id in user_skill_ids
-            or skill_code in user_skill_codes
-        ):
-            known_skills.append(skill)
-        else:
-            missing_skills.append(skill)
-
-    # ---------------------------------------------------------
-    # Get completed roadmap chapters
-    # ---------------------------------------------------------
-
-    progress_docs = list(
-        progress_collection.find({
-            "userId": user_id,
-            "careerId": career["_id"],
-            "isBrushUp": {"$ne": True},
-        })
+    return list(
+        collection.find({"$or": conditions}).sort([
+            ("order", 1),
+            ("Chapter order", 1),
+        ])
     )
 
-    completed_chapter_ids = {
-        str(p["chapterId"])
-        for p in progress_docs
-        if p.get("completed") and p.get("chapterId")
+
+def resolve_chapters(mappings):
+    """Resolve chapter references and preserve mapping order."""
+    collection = get_collection("chapters")
+    resolved = []
+    seen_ids = set()
+
+    for index, mapping in enumerate(mappings):
+        reference = get_value(
+            mapping,
+            "chapterId",
+            "chapter_id",
+            "Chapter ID",
+        )
+
+        if reference is None:
+            continue
+
+        chapter = None
+        object_id = convert_object_id(reference)
+
+        if object_id is not None:
+            chapter = collection.find_one({
+                "_id": object_id,
+                "active": {"$ne": False},
+            })
+
+        if chapter is None:
+            code = str(reference)
+            chapter = collection.find_one({
+                "$or": [
+                    {"chapter_id": code},
+                    {"Chapter ID": code},
+                ],
+                "active": {"$ne": False},
+            })
+
+        if chapter is None:
+            continue
+
+        chapter_id = str(chapter["_id"])
+        if chapter_id in seen_ids:
+            continue
+
+        seen_ids.add(chapter_id)
+
+        mapping_order = get_value(mapping, "order", "Chapter order")
+        chapter_order = get_value(chapter, "order", "Chapter order")
+
+        resolved.append((
+            mapping_order if mapping_order is not None else index,
+            chapter_order if chapter_order is not None else index,
+            index,
+            chapter,
+        ))
+
+    resolved.sort(key=lambda item: (item[0], item[1], item[2]))
+    return [item[3] for item in resolved]
+
+
+def get_user_skill_sets(user_id):
+    """Return the current user's confirmed skill IDs and codes."""
+    collection = get_collection("user_skills")
+    document = collection.find_one({"userId": user_id})
+
+    skill_ids = set()
+    skill_codes = set()
+
+    if not document:
+        return skill_ids, skill_codes
+
+    for entry in document.get("skills", []):
+        if not isinstance(entry, dict):
+            continue
+
+        skill_id = entry.get("skillId")
+        if skill_id is not None:
+            skill_ids.add(str(skill_id))
+
+        code = get_value(entry, "skill_id", "Skill ID", "skillCode")
+        if code:
+            skill_codes.add(str(code))
+
+    return skill_ids, skill_codes
+
+
+def is_known_skill(skill, user_skill_ids, user_skill_codes):
+    skill_id = str(skill["_id"])
+    skill_code = get_skill_code(skill)
+
+    return (
+        skill_id in user_skill_ids
+        or (
+            skill_code is not None
+            and str(skill_code) in user_skill_codes
+        )
+    )
+
+
+def format_chapter(chapter, completed):
+    return {
+        "_id": str(chapter["_id"]),
+        "chapterId": get_chapter_code(chapter) or "",
+        "title": chapter.get("title") or chapter.get("Chapter name") or "",
+        "description": (
+            chapter.get("description")
+            or chapter.get("Chapter description")
+            or ""
+        ),
+        "youtubeUrl": (
+            chapter.get("youtubeUrl")
+            or chapter.get("resource_url")
+            or chapter.get("Link")
+            or ""
+        ),
+        "duration": chapter.get("duration") or "",
+        "order": (
+            chapter.get("order")
+            or chapter.get("Chapter order")
+            or 0
+        ),
+        "completed": completed,
     }
 
-    # ---------------------------------------------------------
-    # Build roadmap
-    # ---------------------------------------------------------
+
+def build_roadmap(user_id, career_id):
+    careers = get_collection("careers")
+    progress_collection = get_collection("roadmap_progress")
+
+    career_object_id = to_objectid(career_id)
+    if career_object_id is None:
+        return None
+
+    career = careers.find_one({"_id": career_object_id})
+    if career is None:
+        return None
+
+    career_code = get_career_code(career)
+
+    # Resolve career skills from ObjectId or legacy mappings.
+    mappings = get_career_skill_mappings(career)
+    ordered_skills = resolve_skills(mappings)
+
+    # Separate confirmed skills from missing skills.
+    user_skill_ids, user_skill_codes = get_user_skill_sets(user_id)
+
+    missing_skills = []
+    for skill in ordered_skills:
+        if not is_known_skill(skill, user_skill_ids, user_skill_codes):
+            missing_skills.append(skill)
+
+    # Load completed roadmap chapters. Brush-up progress is excluded.
+    progress_docs = list(progress_collection.find({
+        "userId": user_id,
+        "careerId": career["_id"],
+        "isBrushUp": {"$ne": True},
+    }))
+
+    completed_ids = {
+        str(document["chapterId"])
+        for document in progress_docs
+        if document.get("completed") and document.get("chapterId") is not None
+    }
 
     roadmap_skills = []
-
     total_chapters = 0
     completed_chapters = 0
 
     for skill in missing_skills:
-
-        skill_code = (
-            skill.get("skill_id")
-            or skill.get("Skill ID")
-            or skill.get("skillCode")
-        )
-
-        # -----------------------------------------------------
-        # Find skill -> chapter mappings
-        #
-        # Your database uses:
-        #
-        # skill_id  = "SK0201"
-        # chapter_id = "CH02014"
-        #
-        # -----------------------------------------------------
-
-        mapping_query = {
-            "$or": [
-                {"skill_id": skill_code},
-                {"Skill ID": skill_code},
-                {"skillId": skill_code},
-                {"skillId": skill["_id"]},
-            ]
-        }
-
-        skill_chapter_mappings = list(
-            skill_chapter_collection.find(mapping_query).sort(
-                [
-                    ("order", 1),
-                    ("Chapter order", 1),
-                ]
-            )
-        )
-
-        chapter_codes = []
-        chapter_object_ids = []
-
-        for mapping in skill_chapter_mappings:
-
-            chapter_id = (
-                mapping.get("chapter_id")
-                or mapping.get("Chapter ID")
-                or mapping.get("chapterId")
-            )
-
-            if not chapter_id:
-                continue
-
-            # If mapping contains an ObjectId
-            if hasattr(chapter_id, "binary"):
-                chapter_object_ids.append(chapter_id)
-
-            else:
-                chapter_code = str(chapter_id)
-
-                # If it happens to be an ObjectId string
-                object_id = to_objectid(chapter_code)
-
-                if object_id is not None:
-                    chapter_object_ids.append(object_id)
-
-                # Keep the chapter code too.
-                # Your database uses CH02014 format.
-                chapter_codes.append(chapter_code)
-
-        # -----------------------------------------------------
-        # Find chapters
-        #
-        # Support BOTH:
-        #
-        # _id       -> ObjectId(...)
-        # chapter_id -> "CH02014"
-        # -----------------------------------------------------
-
-        chapter_query_parts = []
-
-        if chapter_object_ids:
-            chapter_query_parts.append({
-                "_id": {"$in": chapter_object_ids}
-            })
-
-        if chapter_codes:
-            chapter_query_parts.extend([
-                {
-                    "chapter_id": {
-                        "$in": chapter_codes
-                    }
-                },
-                {
-                    "Chapter ID": {
-                        "$in": chapter_codes
-                    }
-                },
-            ])
-
-        if chapter_query_parts:
-
-            chapters = list(
-                chapters_collection.find({
-                    "$or": chapter_query_parts,
-                    "active": {"$ne": False},
-                })
-            )
-
-        else:
-            chapters = []
-
-        # -----------------------------------------------------
-        # Preserve mapping order
-        # -----------------------------------------------------
-
-        mapping_order = {}
-
-        for index, mapping in enumerate(skill_chapter_mappings):
-
-            chapter_id = (
-                mapping.get("chapter_id")
-                or mapping.get("Chapter ID")
-                or mapping.get("chapterId")
-            )
-
-            if chapter_id:
-                mapping_order[str(chapter_id)] = (
-                    mapping.get("order")
-                    or mapping.get("Chapter order")
-                    or index
-                )
-
-        def chapter_sort_key(chapter):
-
-            chapter_code = (
-                chapter.get("chapter_id")
-                or chapter.get("Chapter ID")
-                or ""
-            )
-
-            return (
-                mapping_order.get(str(chapter_code), 999999),
-                chapter.get("order", 999999),
-                chapter.get("Chapter order", 999999),
-            )
-
-        chapters.sort(key=chapter_sort_key)
-
-        # -----------------------------------------------------
-        # Build chapter response
-        # -----------------------------------------------------
-
+        chapter_mappings = get_skill_chapter_mappings(skill)
+        chapters = resolve_chapters(chapter_mappings)
         chapter_list = []
 
         for chapter in chapters:
-
-            chapter_object_id = str(chapter["_id"])
-
-            is_completed = (
-                chapter_object_id in completed_chapter_ids
-            )
+            chapter_id = str(chapter["_id"])
+            completed = chapter_id in completed_ids
 
             total_chapters += 1
-
-            if is_completed:
+            if completed:
                 completed_chapters += 1
 
-            chapter_list.append({
-                "_id": chapter_object_id,
-
-                "chapterId": (
-                    chapter.get("chapter_id")
-                    or chapter.get("Chapter ID")
-                    or ""
-                ),
-
-                "title": (
-                    chapter.get("title")
-                    or chapter.get("Chapter name")
-                    or ""
-                ),
-
-                "description": (
-                    chapter.get("description")
-                    or chapter.get("Chapter description")
-                    or ""
-                ),
-
-                "youtubeUrl": (
-                    chapter.get("youtubeUrl")
-                    or chapter.get("resource_url")
-                    or chapter.get("Link")
-                    or ""
-                ),
-
-                "duration": (
-                    chapter.get("duration")
-                    or ""
-                ),
-
-                "order": (
-                    chapter.get("order")
-                    or chapter.get("Chapter order")
-                    or 0
-                ),
-
-                "completed": is_completed,
-            })
-
-        # -----------------------------------------------------
-        # Add skill
-        # -----------------------------------------------------
+            chapter_list.append(format_chapter(chapter, completed))
 
         roadmap_skills.append({
             "_id": str(skill["_id"]),
-
-            "skillCode": skill_code or "",
-
-            "name": (
-                skill.get("name")
-                or skill.get("Skill name")
-                or ""
-            ),
-
+            "skillCode": get_skill_code(skill) or "",
+            "name": skill.get("name") or skill.get("Skill name") or "",
             "description": (
                 skill.get("description")
                 or skill.get("Skill description")
                 or ""
             ),
-
             "category": skill.get("category", ""),
-
             "chapters": chapter_list,
         })
 
-    # ---------------------------------------------------------
-    # Progress
-    # ---------------------------------------------------------
-
     progress = (
-        round(
-            (completed_chapters / total_chapters) * 100
-        )
-        if total_chapters > 0
+        round((completed_chapters / total_chapters) * 100)
+        if total_chapters
         else 0
     )
 
     return {
         "careerId": str(career["_id"]),
-
         "careerCode": career_code,
-
-        "careerName": (
-            career.get("name")
-            or career.get("Career name")
-            or ""
-        ),
-
+        "careerName": career.get("name") or career.get("Career name") or "",
         "skills": roadmap_skills,
-
         "completedChapters": completed_chapters,
-
         "totalChapters": total_chapters,
-
         "progress": progress,
     }
 
 
 def build_brush_up(user_id, career_id):
     careers = get_collection("careers")
-    skills_collection = get_collection("skills")
-    career_skill_collection = get_collection("career_skill_mapping")
-    skill_chapter_collection = get_collection("skill_chapter_mapping")
-    chapters_collection = get_collection("chapters")
     progress_collection = get_collection("roadmap_progress")
 
-    career = careers.find_one({
-        "_id": to_objectid(career_id)
-    })
+    career_object_id = to_objectid(career_id)
+    if career_object_id is None:
+        return []
 
+    career = careers.find_one({"_id": career_object_id})
     if career is None:
         return []
 
-    career_code = (
-        career.get("career_id")
-        or career.get("Career ID")
-        or career.get("careerId")
-    )
+    mappings = get_career_skill_mappings(career)
+    ordered_skills = resolve_skills(mappings)
 
-    # ---------------------------------------------------------
-    # Get career -> skill mappings
-    # ---------------------------------------------------------
+    user_skill_ids, user_skill_codes = get_user_skill_sets(user_id)
 
-    career_mappings = list(
-        career_skill_collection.find({
-            "$or": [
-                {"career_id": career_code},
-                {"Career ID": career_code},
-                {"careerId": career_code},
-            ]
-        })
-    )
-
-    skill_codes = []
-
-    for mapping in career_mappings:
-
-        skill_code = (
-            mapping.get("skill_id")
-            or mapping.get("Skill ID")
-            or mapping.get("skillId")
-        )
-
-        if skill_code:
-            skill_codes.append(str(skill_code))
-
-    # ---------------------------------------------------------
-    # Get skills
-    # ---------------------------------------------------------
-
-    all_skills = list(
-        skills_collection.find({
-            "$or": [
-                {"skill_id": {"$in": skill_codes}},
-                {"Skill ID": {"$in": skill_codes}},
-                {"skillCode": {"$in": skill_codes}},
-            ]
-        })
-    )
-
-    skill_map = {}
-
-    for skill in all_skills:
-
-        code = (
-            skill.get("skill_id")
-            or skill.get("Skill ID")
-            or skill.get("skillCode")
-        )
-
-        if code:
-            skill_map[str(code)] = skill
-
-    ordered_skills = [
-        skill_map[code]
-        for code in skill_codes
-        if code in skill_map
+    known_skills = [
+        skill
+        for skill in ordered_skills
+        if is_known_skill(skill, user_skill_ids, user_skill_codes)
     ]
 
-    # ---------------------------------------------------------
-    # Get user's known skills
-    # ---------------------------------------------------------
+    progress_docs = list(progress_collection.find({
+        "userId": user_id,
+        "careerId": career["_id"],
+        "isBrushUp": True,
+    }))
 
-    user_skills_doc = get_collection("user_skills").find_one({
-        "userId": user_id
-    })
-
-    user_skill_ids = set()
-    user_skill_codes = set()
-
-    if user_skills_doc:
-
-        for entry in user_skills_doc.get("skills", []):
-
-            if not isinstance(entry, dict):
-                continue
-
-            if entry.get("skillId"):
-                user_skill_ids.add(str(entry["skillId"]))
-
-            skill_code = (
-                entry.get("skill_id")
-                or entry.get("Skill ID")
-                or entry.get("skillCode")
-            )
-
-            if skill_code:
-                user_skill_codes.add(str(skill_code))
-
-    # ---------------------------------------------------------
-    # Known skills only
-    # ---------------------------------------------------------
-
-    known_skills = []
-
-    for skill in ordered_skills:
-
-        skill_object_id = str(skill["_id"])
-
-        skill_code = str(
-            skill.get("skill_id")
-            or skill.get("Skill ID")
-            or skill.get("skillCode")
-            or ""
-        )
-
-        if (
-            skill_object_id in user_skill_ids
-            or skill_code in user_skill_codes
-        ):
-            known_skills.append(skill)
-
-    # ---------------------------------------------------------
-    # Brush-up progress
-    # ---------------------------------------------------------
-
-    brush_up_progress = list(
-        progress_collection.find({
-            "userId": user_id,
-            "careerId": career["_id"],
-            "isBrushUp": True,
-        })
-    )
-
-    completed_brushup_ids = {
-        str(p["chapterId"])
-        for p in brush_up_progress
-        if p.get("completed") and p.get("chapterId")
+    completed_ids = {
+        str(document["chapterId"])
+        for document in progress_docs
+        if document.get("completed") and document.get("chapterId") is not None
     }
-
-    # ---------------------------------------------------------
-    # Build brush-up chapters
-    # ---------------------------------------------------------
 
     chapters_result = []
 
     for skill in known_skills:
-
-        skill_code = (
-            skill.get("skill_id")
-            or skill.get("Skill ID")
-            or skill.get("skillCode")
-        )
-
-        mappings = list(
-            skill_chapter_collection.find({
-                "$or": [
-                    {"skill_id": skill_code},
-                    {"Skill ID": skill_code},
-                    {"skillId": skill_code},
-                    {"skillId": skill["_id"]},
-                ]
-            }).sort([
-                ("order", 1),
-                ("Chapter order", 1),
-            ])
-        )
-
-        chapter_codes = []
-        chapter_object_ids = []
-
-        for mapping in mappings:
-
-            chapter_id = (
-                mapping.get("chapter_id")
-                or mapping.get("Chapter ID")
-                or mapping.get("chapterId")
-            )
-
-            if not chapter_id:
-                continue
-
-            if hasattr(chapter_id, "binary"):
-                chapter_object_ids.append(chapter_id)
-            else:
-                chapter_code = str(chapter_id)
-
-                chapter_codes.append(chapter_code)
-
-                object_id = to_objectid(chapter_code)
-
-                if object_id is not None:
-                    chapter_object_ids.append(object_id)
-
-        query_parts = []
-
-        if chapter_object_ids:
-            query_parts.append({
-                "_id": {"$in": chapter_object_ids}
-            })
-
-        if chapter_codes:
-            query_parts.extend([
-                {
-                    "chapter_id": {
-                        "$in": chapter_codes
-                    }
-                },
-                {
-                    "Chapter ID": {
-                        "$in": chapter_codes
-                    }
-                },
-            ])
-
-        if query_parts:
-
-            chapters = list(
-                chapters_collection.find({
-                    "$or": query_parts,
-                    "active": {"$ne": False},
-                })
-            )
-
-        else:
-            chapters = []
-
-        chapters.sort(
-            key=lambda c: (
-                c.get("order")
-                or c.get("Chapter order")
-                or 0
-            )
-        )
+        chapter_mappings = get_skill_chapter_mappings(skill)
+        chapters = resolve_chapters(chapter_mappings)
 
         for chapter in chapters:
-
-            chapter_object_id = str(chapter["_id"])
+            chapter_id = str(chapter["_id"])
 
             chapters_result.append({
-                "_id": chapter_object_id,
-
-                "chapterId": (
-                    chapter.get("chapter_id")
-                    or chapter.get("Chapter ID")
-                    or ""
-                ),
-
+                "_id": chapter_id,
+                "chapterId": get_chapter_code(chapter) or "",
                 "title": (
                     chapter.get("title")
                     or chapter.get("Chapter name")
                     or ""
                 ),
-
                 "description": (
                     chapter.get("description")
                     or chapter.get("Chapter description")
                     or ""
                 ),
-
                 "youtubeUrl": (
                     chapter.get("youtubeUrl")
                     or chapter.get("resource_url")
                     or chapter.get("Link")
                     or ""
                 ),
-
-                "duration": (
-                    chapter.get("duration")
-                    or ""
-                ),
-
+                "duration": chapter.get("duration") or "",
                 "skillName": (
                     skill.get("name")
                     or skill.get("Skill name")
                     or ""
                 ),
-
-                "completed": (
-                    chapter_object_id in completed_brushup_ids
-                ),
+                "completed": chapter_id in completed_ids,
             })
 
     return chapters_result

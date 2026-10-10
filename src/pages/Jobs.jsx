@@ -6,15 +6,19 @@ import {
   Building2,
   Search,
   Calendar,
+  Lock,
 } from 'lucide-react';
 
 import { jobAPI } from '@/services/api';
+import { useAuth } from '@/context/AuthContext';
 import { useDebounce } from '@/hooks/useHooks';
 import { FullPageSpinner } from '@/components/Spinner';
 import { ErrorState, EmptyState } from '@/components/States';
 import { formatDate } from '@/utils/helpers';
 
 export default function Jobs() {
+  const { isAuthenticated } = useAuth();
+
   const [jobs, setJobs] = useState([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
@@ -54,9 +58,13 @@ export default function Jobs() {
   return (
     <div className="animate-fade-in">
 
-      {/* Header */}
+      {/* ============================================================
+          HEADER
+      ============================================================ */}
       <div className="mb-6">
+
         <div className="flex items-center gap-2 mb-2">
+
           <Briefcase
             size={24}
             style={{ color: 'var(--primary)' }}
@@ -66,18 +74,26 @@ export default function Jobs() {
             className="text-2xl font-heading font-bold"
             style={{ color: 'var(--text)' }}
           >
-            Relevant Jobs
+            IT Job Opportunities
           </h1>
+
         </div>
 
         <p className="text-muted">
-          External job opportunities related to your career path.
-          Click to apply on the original site.
+          Explore current technology and IT job opportunities.
+          {isAuthenticated
+            ? ' Sign in to access external job listings and application pages.'
+            : ' Log in to access the original job listing and application page.'}
         </p>
+
       </div>
 
-      {/* Search */}
+
+      {/* ============================================================
+          SEARCH
+      ============================================================ */}
       <div className="relative mb-6">
+
         <Search
           size={18}
           className="absolute left-3 top-1/2 -translate-y-1/2 text-muted"
@@ -86,21 +102,65 @@ export default function Jobs() {
         <input
           type="text"
           className="input pl-10"
-          placeholder="Search jobs..."
+          placeholder="Search IT jobs..."
           value={search}
           onChange={(e) => {
             setSearch(e.target.value);
             setPage(1);
           }}
         />
+
       </div>
 
-      {/* Loading */}
+
+      {/* ============================================================
+          LOGIN INFORMATION FOR GUESTS
+      ============================================================ */}
+      {!isAuthenticated && (
+        <div
+          className="card p-4 mb-6 flex items-start gap-3"
+          style={{
+            background: 'rgba(64, 61, 136, 0.06)',
+            borderColor: 'rgba(64, 61, 136, 0.15)',
+          }}
+        >
+
+          <Lock
+            size={20}
+            className="flex-shrink-0 mt-0.5"
+            style={{ color: 'var(--primary)' }}
+          />
+
+          <div>
+
+            <p
+              className="font-medium"
+              style={{ color: 'var(--text)' }}
+            >
+              Browse job opportunities freely
+            </p>
+
+            <p className="text-sm text-muted mt-1">
+              You're viewing job previews as a guest.
+              Log in to access the original job listing and
+              application page.
+            </p>
+
+          </div>
+
+        </div>
+      )}
+
+
+      {/* ============================================================
+          LOADING
+      ============================================================ */}
       {loading ? (
+
         <FullPageSpinner label="Loading jobs..." />
+
       ) : error ? (
 
-        /* Error */
         <ErrorState
           message={error}
           onRetry={fetchJobs}
@@ -108,27 +168,22 @@ export default function Jobs() {
 
       ) : jobs.length === 0 ? (
 
-        /* Empty */
         <EmptyState
           icon={Briefcase}
           title="No jobs available"
-          message="External job data is currently unavailable. This feature requires a job data provider to be configured. Check back later."
+          message="External job data is currently unavailable. Please check back later."
         />
 
       ) : (
 
-        /* Jobs */
         <>
+          {/* ========================================================
+              JOB LIST
+          ======================================================== */}
           <div className="space-y-4">
 
             {jobs.map((job) => {
 
-              /*
-               * Adzuna normally provides `id`.
-               * Older/local job objects may use `_id`.
-               * The fallback ensures React always receives
-               * a unique key.
-               */
               const jobKey =
                 job.id ||
                 job._id ||
@@ -139,13 +194,16 @@ export default function Jobs() {
                   key={jobKey}
                   className="card p-5 hover:shadow-soft transition-shadow"
                 >
+
                   <div className="flex flex-col sm:flex-row items-start justify-between gap-4">
 
-                    {/* Job Information */}
+                    {/* =================================================
+                        JOB INFORMATION
+                    ================================================= */}
                     <div className="flex-1">
 
                       {/* Title + Category */}
-                      <div className="flex items-center gap-2 mb-2">
+                      <div className="flex flex-wrap items-center gap-2 mb-2">
 
                         <h3
                           className="text-lg font-semibold"
@@ -161,6 +219,7 @@ export default function Jobs() {
                         )}
 
                       </div>
+
 
                       {/* Company / Location / Date */}
                       <div className="flex flex-wrap items-center gap-4 text-sm text-muted">
@@ -188,6 +247,7 @@ export default function Jobs() {
 
                       </div>
 
+
                       {/* Skills */}
                       {job.skills && job.skills.length > 0 && (
                         <div className="flex flex-wrap gap-1.5 mt-3">
@@ -204,6 +264,7 @@ export default function Jobs() {
                         </div>
                       )}
 
+
                       {/* Salary */}
                       {job.salary && (
                         <p
@@ -216,27 +277,74 @@ export default function Jobs() {
 
                     </div>
 
-                    {/* Apply Button */}
-                    {job.externalUrl && (
-                      <a
-                        href={job.externalUrl}
-                        target="_blank"
-                        rel="noopener noreferrer"
-                        className="btn-primary"
-                      >
-                        <ExternalLink size={16} />
-                        Apply
-                      </a>
-                    )}
+
+                    {/* =================================================
+                        GUEST / LOGGED-IN ACTION
+                    ================================================= */}
+                    <div className="flex-shrink-0">
+
+                      {isAuthenticated ? (
+
+                        /* Logged-in user */
+                        job.externalUrl && (
+                          <a
+                            href={job.externalUrl}
+                            target="_blank"
+                            rel="noopener noreferrer"
+                            className="btn-primary inline-flex items-center gap-2"
+                          >
+                            <ExternalLink size={16} />
+                            View Job
+                          </a>
+                        )
+
+                      ) : (
+
+                        /* Guest user */
+                        <a
+                          href="/login"
+                          className="btn-outline inline-flex items-center gap-2"
+                        >
+                          <Lock size={16} />
+                          Login to View
+                        </a>
+
+                      )}
+
+                    </div>
 
                   </div>
+
+
+                  {/* ===================================================
+                      GUEST NOTICE
+                  =================================================== */}
+                  {!isAuthenticated && (
+                    <div className="mt-4 pt-3 border-t border-themed">
+
+                      <p className="text-xs text-muted flex items-center gap-1.5">
+
+                        <Lock size={13} />
+
+                        Job details are shown as a preview.
+                        Login to access the original listing
+                        and application page.
+
+                      </p>
+
+                    </div>
+                  )}
+
                 </div>
               );
             })}
 
           </div>
 
-          {/* Pagination */}
+
+          {/* ========================================================
+              PAGINATION
+          ======================================================== */}
           {totalPages > 1 && (
             <div className="flex items-center justify-center gap-2 mt-6">
 

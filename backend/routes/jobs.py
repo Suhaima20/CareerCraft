@@ -69,8 +69,11 @@ def fetch_adzuna_search(search_term):
     params = {
         "app_id": app_id,
         "app_key": app_key,
-        "what": search_term
-    }
+        "what": search_term,
+        "where": "India",
+        "results_per_page": 20,
+        "content-type": "application/json"
+ }
 
     try:
 
@@ -97,6 +100,7 @@ def fetch_adzuna_search(search_term):
 
         try:
             data = response.json()
+
         except ValueError:
 
             print(
@@ -105,7 +109,10 @@ def fetch_adzuna_search(search_term):
 
             return []
 
-        results = data.get("results", [])
+        results = data.get(
+            "results",
+            []
+        )
 
         print(
             f"Jobs received [{search_term}]:",
@@ -184,6 +191,9 @@ def fetch_adzuna_search(search_term):
 
                 # -------------------------------------------------
                 # APPLY URL
+                #
+                # These are kept internally in the server cache.
+                # They are removed from responses sent to guests.
                 # -------------------------------------------------
 
                 "externalUrl": external_url,
@@ -366,7 +376,9 @@ def fetch_all_jobs():
 
                 jobs = future.result()
 
-                all_jobs.extend(jobs)
+                all_jobs.extend(
+                    jobs
+                )
 
             except Exception as e:
 
@@ -426,11 +438,52 @@ def fetch_all_jobs():
 
 
 # =========================================================
+# SANITIZE JOBS FOR GUEST USERS
+#
+# IMPORTANT:
+# The guest should see job information but must NOT receive
+# the external application URL from the backend.
+# =========================================================
+
+def sanitize_jobs_for_guest(jobs):
+
+    sanitized = []
+
+    for job in jobs:
+
+        guest_job = dict(job)
+
+        # Remove external application URLs completely.
+        guest_job.pop(
+            "externalUrl",
+            None
+        )
+
+        guest_job.pop(
+            "url",
+            None
+        )
+
+        # Explicit frontend indicator.
+        guest_job["requiresLogin"] = True
+
+        sanitized.append(
+            guest_job
+        )
+
+    return sanitized
+
+
+# =========================================================
 # JOBS API
+#
+# PUBLIC ENDPOINT
+#
+# Guests can browse job previews.
+# Logged-in users receive external application URLs.
 # =========================================================
 
 @jobs_bp.route("", methods=["GET"])
-@token_required
 def list_jobs():
 
     # =========================================================
@@ -604,6 +657,71 @@ def list_jobs():
     ]
 
     # =========================================================
+    # DETERMINE AUTHENTICATION
+    #
+    # We intentionally do NOT use @token_required here because
+    # the endpoint must be public.
+    #
+    # Instead, inspect the Authorization header when present.
+    #
+    # IMPORTANT:
+    # The existing token_required decorator is still used for
+    # protected endpoints elsewhere in the application.
+    # =========================================================
+
+    authorization = (
+        request.headers.get(
+            "Authorization",
+            ""
+        )
+    )
+
+    is_authenticated = False
+
+    if authorization.startswith(
+        "Bearer "
+    ):
+
+        token = authorization.split(
+            " ",
+            1
+        )[1].strip()
+
+        if token:
+
+            try:
+
+                # Import here to avoid changing the existing
+                # authentication architecture globally.
+                from flask import g
+                import jwt
+
+                payload = jwt.decode(
+                    token,
+                    Config.JWT_SECRET_KEY,
+                    algorithms=["HS256"]
+                )
+
+                if payload:
+                    is_authenticated = True
+
+            except Exception:
+
+                is_authenticated = False
+
+    # =========================================================
+    # SANITIZE FOR GUEST
+    # =========================================================
+
+    if not is_authenticated:
+
+        paginated_jobs = (
+            sanitize_jobs_for_guest(
+                paginated_jobs
+            )
+        )
+
+    # =========================================================
     # LOG
     # =========================================================
 
@@ -614,6 +732,10 @@ def list_jobs():
     print(
         "Query:",
         search_query or "IT & Engineering"
+    )
+    print(
+        "Authenticated:",
+        is_authenticated
     )
     print(
         "Total:",
@@ -649,6 +771,9 @@ def list_jobs():
             search_query
             or "IT & Engineering",
 
-        "page": page
+        "page": page,
+
+        "requiresLoginForExternalLinks":
+            not is_authenticated
 
     }), 200

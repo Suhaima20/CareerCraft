@@ -64,3 +64,28 @@ Thumbs.db
 *.njsproj
 *.sln
 *.sw?
+
+
+# =========================
+
+# Local database backups and temporary copies
+
+# =========================
+
+backend/backups/
+backend/routes/*.backup
+backend/routes/**backup**.py
+backend/services/**backup**.py
+
+# Local test files
+
+backend/test_email.py
+
+# Local data files - keep private until reviewed
+
+# Uncomment the next line only if all files in backend/data are local-only
+
+# backend/data/
+
+# Local master-data workbook
+backend/data/UPDATEDOCRCFT.xlsx

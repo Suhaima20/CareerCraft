@@ -252,42 +252,271 @@ def convert_objectids_to_skill_codes(
 # ============================================================
 # CALCULATE CAREER MATCH
 # ============================================================
+from flask import Blueprint, request, jsonify, g
+from datetime import datetime, timezone
+from bson import ObjectId
 
-def calculate_career_match(
-    career,
-    user_skill_codes
-):
-    """
-    Calculate how many required skills
-    the user has for a career.
-    """
+from db import get_collection
+from utils.auth import token_required
+from utils.serialization import serialize_doc
+from services.streak import update_streak
 
-    career_code = get_career_code(career)
 
-    mappings = get_career_skill_mappings(
-        career_code
+careers_bp = Blueprint(
+    "careers",
+    __name__,
+    url_prefix="/careers"
+)
+
+
+# ============================================================
+# HELPERS
+# ============================================================
+
+def get_career_code(career):
+    """Return the career code from either supported schema."""
+    return (
+        career.get("career_id")
+        or career.get("Career ID")
     )
 
-    required_codes = []
+
+def get_skill_code(skill):
+    """Return the skill code from either supported schema."""
+    return (
+        skill.get("skill_id")
+        or skill.get("Skill ID")
+    )
+
+
+def _resolve_skill(reference):
+    """
+    Resolve a skill using:
+    - MongoDB ObjectId
+    - ObjectId represented as a string
+    - Legacy skill code
+    """
+    skills_collection = get_collection("skills")
+
+    if reference is None:
+        return None
+
+    if isinstance(reference, ObjectId):
+        return skills_collection.find_one({
+            "_id": reference
+        })
+
+    if isinstance(reference, str):
+        reference = reference.strip()
+
+        if not reference:
+            return None
+
+        # Try ObjectId string first.
+        try:
+            skill = skills_collection.find_one({
+                "_id": ObjectId(reference)
+            })
+
+            if skill:
+                return skill
+
+        except Exception:
+            pass
+
+        # Fall back to legacy skill codes.
+        return skills_collection.find_one({
+            "$or": [
+                {"skill_id": reference},
+                {"Skill ID": reference}
+            ]
+        })
+
+    return None
+
+
+def get_career_skill_mappings(career_code):
+    """
+    Support current ObjectId-based mappings and
+    legacy career-code-based mappings.
+    """
+    careers_collection = get_collection("careers")
+    mapping_collection = get_collection(
+        "career_skill_mapping"
+    )
+
+    career = careers_collection.find_one({
+        "$or": [
+            {"career_id": career_code},
+            {"Career ID": career_code}
+        ]
+    })
+
+    conditions = [
+        {"career_id": career_code},
+        {"Career ID": career_code}
+    ]
+
+    if career:
+        conditions.append({
+            "careerId": career["_id"]
+        })
+
+    return list(
+        mapping_collection.find({
+            "$or": conditions
+        }).sort("order", 1)
+    )
+
+
+def get_skills_for_career(career_code):
+    """
+    Resolve the unique required skills for a career.
+    Preserve mapping order and support both schemas.
+    """
+    mappings = get_career_skill_mappings(career_code)
+
+    ordered_skills = []
+    seen_ids = set()
 
     for mapping in mappings:
-
-        code = (
-            mapping.get("skill_id")
+        reference = (
+            mapping.get("skillId")
+            or mapping.get("skill_id")
             or mapping.get("Skill ID")
         )
 
-        if code:
-            required_codes.append(
-                str(code)
-            )
+        skill = _resolve_skill(reference)
 
-    required_codes = list(
-        dict.fromkeys(required_codes)
+        if not skill:
+            continue
+
+        skill_id = skill["_id"]
+
+        if skill_id in seen_ids:
+            continue
+
+        seen_ids.add(skill_id)
+        ordered_skills.append(skill)
+
+    return ordered_skills
+
+
+# ============================================================
+# GET USER SKILLS
+# ============================================================
+
+def get_user_skill_codes():
+    """
+    Collect unique skills from the user's confirmed skills
+    and latest extracted resume.
+
+    Resolve ObjectIds into skill codes before comparison.
+    """
+    user_skill_codes = set()
+
+    # --------------------------------------------------------
+    # 1. CONFIRMED USER SKILLS
+    # --------------------------------------------------------
+
+    user_skills_doc = get_collection(
+        "user_skills"
+    ).find_one({
+        "userId": g.current_user_id
+    })
+
+    if user_skills_doc:
+        for item in user_skills_doc.get("skills", []):
+            if isinstance(item, dict):
+                reference = (
+                    item.get("skillId")
+                    or item.get("skill_id")
+                    or item.get("Skill ID")
+                )
+
+            elif isinstance(item, (str, ObjectId)):
+                reference = item
+
+            else:
+                continue
+
+            skill = _resolve_skill(reference)
+
+            if skill:
+                code = get_skill_code(skill)
+
+                if code:
+                    user_skill_codes.add(str(code))
+
+    # --------------------------------------------------------
+    # 2. LATEST EXTRACTED RESUME
+    # --------------------------------------------------------
+
+    resume = get_collection("resumes").find_one(
+        {
+            "userId": g.current_user_id,
+            "status": "extracted"
+        },
+        sort=[("createdAt", -1)]
     )
 
-    if not required_codes:
+    if resume:
+        for reference in resume.get(
+            "extractedSkillIds", []
+        ):
+            skill = _resolve_skill(reference)
 
+            if skill:
+                code = get_skill_code(skill)
+
+                if code:
+                    user_skill_codes.add(str(code))
+
+    return user_skill_codes
+
+
+def convert_objectids_to_skill_codes(user_skill_codes):
+    """
+    Retain the existing helper interface for compatibility.
+    Resolve references into unique skill codes.
+    """
+    resolved_codes = set()
+
+    for reference in user_skill_codes:
+        skill = _resolve_skill(reference)
+
+        if skill:
+            code = get_skill_code(skill)
+
+            if code:
+                resolved_codes.add(str(code))
+                continue
+
+        # Preserve an existing valid legacy skill code.
+        if isinstance(reference, str):
+            legacy_skill = _resolve_skill(reference)
+
+            if legacy_skill:
+                code = get_skill_code(legacy_skill)
+
+                if code:
+                    resolved_codes.add(str(code))
+
+    return resolved_codes
+
+
+# ============================================================
+# CALCULATE CAREER MATCH
+# ============================================================
+
+def calculate_career_match(career, user_skill_codes):
+    """
+    Compare unique user skill codes with unique required
+    skill codes for a career.
+    """
+    career_code = get_career_code(career)
+
+    if not career_code:
         return {
             "matchPercentage": 0,
             "knownCount": 0,
@@ -296,105 +525,73 @@ def calculate_career_match(
             "matchedSkills": []
         }
 
+    required_skills = get_skills_for_career(career_code)
+
+    # --------------------------------------------------------
+    # BUILD UNIQUE REQUIRED SKILLS
+    # --------------------------------------------------------
+
+    required_by_code = {}
+
+    for skill in required_skills:
+        code = get_skill_code(skill)
+
+        if code:
+            required_by_code[str(code)] = skill
+
+    required_codes = list(required_by_code.keys())
+
+    user_codes = {
+        str(code)
+        for code in user_skill_codes
+    }
+
+    # --------------------------------------------------------
+    # COMPARE SKILLS
+    # --------------------------------------------------------
+
     matched_codes = [
         code
         for code in required_codes
-        if code in user_skill_codes
+        if code in user_codes
     ]
 
     missing_codes = [
         code
         for code in required_codes
-        if code not in user_skill_codes
+        if code not in user_codes
+    ]
+
+    matched_skills = [
+        required_by_code[code]
+        for code in matched_codes
+    ]
+
+    missing_skills = [
+        required_by_code[code]
+        for code in missing_codes
     ]
 
     # --------------------------------------------------------
-    # GET SKILL DOCUMENTS
+    # CALCULATE MATCH PERCENTAGE
     # --------------------------------------------------------
 
-    all_skill_codes = (
-        matched_codes +
-        missing_codes
-    )
+    known_count = len(matched_codes)
+    total_required = len(required_codes)
 
-    skills = list(
-        get_collection("skills").find({
-            "$or": [
-                {
-                    "skill_id": {
-                        "$in": all_skill_codes
-                    }
-                },
-                {
-                    "Skill ID": {
-                        "$in": all_skill_codes
-                    }
-                }
-            ]
-        })
-    )
-
-    skill_by_code = {}
-
-    for skill in skills:
-
-        code = get_skill_code(skill)
-
-        if code:
-            skill_by_code[str(code)] = skill
-
-    # --------------------------------------------------------
-    # MATCHED SKILLS
-    # --------------------------------------------------------
-
-    matched_skills = []
-
-    for code in matched_codes:
-
-        if code in skill_by_code:
-
-            matched_skills.append(
-                skill_by_code[code]
-            )
-
-    # --------------------------------------------------------
-    # MISSING SKILLS
-    # --------------------------------------------------------
-
-    missing_skills = []
-
-    for code in missing_codes:
-
-        if code in skill_by_code:
-
-            missing_skills.append(
-                skill_by_code[code]
-            )
-
-    # --------------------------------------------------------
-    # MATCH PERCENTAGE
-    # --------------------------------------------------------
-
-    percentage = round(
-        (
-            len(matched_codes)
-            /
-            len(required_codes)
-        ) * 100
+    percentage = (
+        round((known_count / total_required) * 100)
+        if total_required
+        else 0
     )
 
     return {
         "matchPercentage": percentage,
-        "knownCount": len(matched_codes),
-        "totalRequired": len(required_codes),
-        "matchedSkills": serialize_doc(
-            matched_skills
-        ),
-        "missingSkills": serialize_doc(
-            missing_skills
-        )
+        "knownCount": known_count,
+        "totalRequired": total_required,
+        "matchedSkills": serialize_doc(matched_skills),
+        "missingSkills": serialize_doc(missing_skills)
     }
-
 
 # ============================================================
 # LIST CAREERS

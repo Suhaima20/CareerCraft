@@ -1,5 +1,5 @@
 import { useState, useEffect } from 'react';
-import { Users, Briefcase, GraduationCap, BookOpen, FileText, MessageSquare, TrendingUp, Activity } from 'lucide-react';
+import { Users, Briefcase, GraduationCap, BookOpen, FileText, MessageSquare, Activity } from 'lucide-react';
 import { adminAPI } from '@/services/api';
 import { FullPageSpinner } from '@/components/Spinner';
 import { ErrorState } from '@/components/States';
@@ -35,9 +35,7 @@ export default function AdminDashboard() {
     { icon: BookOpen, label: 'Chapters', value: stats?.totalChapters || 0, color: 'var(--primary)' },
     { icon: FileText, label: 'Resume Uploads', value: stats?.totalResumes || 0, color: '#C99A2E' },
     { icon: MessageSquare, label: 'Feedback', value: stats?.totalFeedback || 0, color: '#B5444B' },
-    { icon: TrendingUp, label: 'Trending Items', value: stats?.totalTrending || 0, color: 'var(--secondary)' },
   ];
-
   return (
     <div className="animate-fade-in">
       <div className="mb-6">
