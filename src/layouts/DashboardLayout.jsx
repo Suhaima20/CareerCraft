@@ -1,4 +1,3 @@
-
 import { Outlet, Link, useNavigate, useLocation } from 'react-router-dom';
 import { useState } from 'react';
 import {
@@ -17,6 +16,7 @@ import {
   GraduationCap,
   Award,
   Clock3,
+  Brain,
 } from 'lucide-react';
 
 import { useAuth } from '../context/AuthContext';
@@ -37,14 +37,48 @@ export default function DashboardLayout() {
     navigate('/');
   };
 
+  // Main student navigation
   const navItems = [
-    { to: '/dashboard', label: 'Dashboard', icon: LayoutDashboard },
-    { to: '/roadmap', label: 'My Roadmap', icon: GraduationCap },
-    { to: '/achievements', label: 'Achievements', icon: Award },
-    { to: '/jobs', label: 'Jobs', icon: Briefcase },
-    { to: '/market', label: 'Market Intelligence', icon: BarChart3 },
-    { to: '/resume-builder', label: 'Resume Builder', icon: FileText },
-    { to: '/study-reminders', label: 'Study Reminders', icon: Clock3 },
+    {
+      to: '/dashboard',
+      label: 'Dashboard',
+      icon: LayoutDashboard,
+    },
+    {
+      to: '/roadmap',
+      label: 'My Roadmap',
+      icon: GraduationCap,
+    },
+    {
+      to: '/achievements',
+      label: 'Achievements',
+      icon: Award,
+    },
+    {
+      to: '/jobs',
+      label: 'Jobs',
+      icon: Briefcase,
+    },
+    {
+      to: '/market',
+      label: 'Market Intelligence',
+      icon: BarChart3,
+    },
+    {
+      to: '/aptitude-practice',
+      label: 'Aptitude Practice',
+      icon: Brain,
+    },
+    {
+      to: '/resume-builder',
+      label: 'Resume Builder',
+      icon: FileText,
+    },
+    {
+      to: '/study-reminders',
+      label: 'Study Reminders',
+      icon: Clock3,
+    },
   ];
 
   const isActive = (path) =>
@@ -62,6 +96,7 @@ export default function DashboardLayout() {
             : '-translate-x-full lg:translate-x-0'
         }`}
       >
+        {/* Sidebar Header */}
         <div className="flex items-center justify-between p-4 border-b border-themed">
 
           <Link
@@ -76,11 +111,13 @@ export default function DashboardLayout() {
           <button
             onClick={() => setSidebarOpen(false)}
             className="lg:hidden btn-ghost p-1"
+            aria-label="Close navigation menu"
           >
             <X size={20} />
           </button>
         </div>
 
+        {/* Navigation Links */}
         <nav
           className="p-3 space-y-1 overflow-y-auto scrollbar-thin"
           style={{ maxHeight: 'calc(100vh - 200px)' }}
@@ -102,11 +139,12 @@ export default function DashboardLayout() {
               }
             >
               <item.icon size={18} />
-              {item.label}
+              <span>{item.label}</span>
             </Link>
           ))}
         </nav>
 
+        {/* User Profile and Logout */}
         <div className="absolute bottom-0 left-0 right-0 p-3 border-t border-themed">
 
           <div className="flex items-center gap-3 px-2 py-2">
@@ -141,6 +179,7 @@ export default function DashboardLayout() {
         </div>
       </aside>
 
+      {/* Mobile Sidebar Overlay */}
       {sidebarOpen && (
         <div
           className="fixed inset-0 bg-black/50 z-30 lg:hidden"
@@ -148,9 +187,10 @@ export default function DashboardLayout() {
         />
       )}
 
-      {/* Main content */}
+      {/* Main Content */}
       <div className="flex-1 flex flex-col min-w-0">
 
+        {/* Top Header */}
         <header className="sticky top-0 z-20 backdrop-blur-md bg-bg/80 border-b border-themed">
 
           <div className="flex items-center justify-between px-4 sm:px-6 h-16">
@@ -160,6 +200,7 @@ export default function DashboardLayout() {
               <button
                 onClick={() => setSidebarOpen(true)}
                 className="lg:hidden btn-ghost p-2"
+                aria-label="Open navigation menu"
               >
                 <Menu size={20} />
               </button>
@@ -173,6 +214,7 @@ export default function DashboardLayout() {
               </Link>
             </div>
 
+            {/* Header Actions */}
             <div className="flex items-center gap-2">
 
               <Link
@@ -205,6 +247,7 @@ export default function DashboardLayout() {
           </div>
         </header>
 
+        {/* Page Content */}
         <main className="flex-1 p-4 sm:p-6 lg:p-8 max-w-7xl w-full mx-auto">
           <Outlet />
         </main>

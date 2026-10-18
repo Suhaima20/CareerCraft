@@ -123,6 +123,7 @@ from routes.jobs import jobs_bp
 from routes.market import market_bp
 from routes.resume_builder import resume_builder_bp
 from routes.feedback import feedback_bp
+from routes.aptitude import aptitude_bp
 
 
 # ============================================================
@@ -262,6 +263,15 @@ app.register_blueprint(
 app.register_blueprint(
     feedback_bp,
     url_prefix="/api"
+)
+
+# ============================================================
+# APTITUDE PRACTICE
+# ============================================================
+
+app.register_blueprint(
+    aptitude_bp,
+    url_prefix="/api/aptitude-resources"
 )
 
 

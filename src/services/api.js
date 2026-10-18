@@ -22,31 +22,29 @@ const api = axios.create({
 // ============================================================
 
 api.interceptors.request.use(
-  (config) => {
-    const url = config.url || '';
+(config) => {
+const url = config.url || '';
 
-    const isAdminRequest =
-      url.startsWith('/admin');
+const isAdminRequest =
+  url.startsWith('/admin') ||
+  url.startsWith('/aptitude-resources/admin');
 
-    const token = isAdminRequest
-      ? localStorage.getItem(
-          'careercraft_admin_token'
-        )
-      : localStorage.getItem(
-          'careercraft_token'
-        );
+const token = isAdminRequest
+  ? localStorage.getItem('careercraft_admin_token')
+  : localStorage.getItem('careercraft_token');
 
-    if (token) {
-      config.headers = config.headers || {};
+if (token) {
+  config.headers = config.headers || {};
+  config.headers.Authorization = `Bearer ${token}`;
+}
 
-      config.headers.Authorization =
-        `Bearer ${token}`;
-    }
+return config;
 
-    return config;
-  },
-  (error) => Promise.reject(error)
+
+},
+(error) => Promise.reject(error)
 );
+
 
 // ============================================================
 // HANDLE AUTH ERRORS
@@ -533,6 +531,22 @@ export const feedbackAPI = {
 
 export const adminAPI = {
 
+    // Aptitude Practice resource management
+  listAptitudeResources: () =>
+    api.get('/aptitude-resources/admin'),
+
+  createAptitudeResource: (data) =>
+    api.post('/aptitude-resources/admin', data),
+
+  updateAptitudeResource: (id, data) =>
+    api.put(`/aptitude-resources/admin/${id}`, data),
+
+  toggleAptitudeResource: (id) =>
+    api.put(`/aptitude-resources/admin/${id}/toggle`),
+
+  deleteAptitudeResource: (id) =>
+    api.delete(`/aptitude-resources/admin/${id}`),
+
   // ==========================================================
   // DASHBOARD
   // ==========================================================
@@ -924,4 +938,14 @@ export const studyReminderAPI = {
     api.put(
       `/study-reminders/${id}/snooze`
     ),
+}
+// ============================================================
+// APTITUDE PRACTICE API - USER SIDE
+// ============================================================
+
+export const aptitudeAPI = {
+  list: (params = {}) =>
+    api.get('/aptitude-resources/', {
+      params,
+    }),
 };

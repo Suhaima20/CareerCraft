@@ -52,7 +52,9 @@ import AdminFeedback from './pages/admin/AdminFeedback';
 import AdminExports from './pages/admin/AdminExports';
 import AdminAuditLogs from './pages/admin/AdminAuditLogs';
 import QuizManagement from './pages/admin/QuizManagement';
+import AdminAptitudePractice from './pages/admin/AdminAptitudePractice';
 
+import AptitudePractice from './pages/AptitudePractice';
 import NotFound from './pages/NotFound';
 
 export default function App() {
@@ -233,6 +235,11 @@ export default function App() {
                     element={<StudyReminders />}
                   />
 
+                  <Route
+                    path="/aptitude-practice"
+                   element={<AptitudePractice />}
+                  />
+
                 </Route>
 
 
@@ -286,6 +293,11 @@ export default function App() {
                     path="/admin/quizzes"
                     element={<QuizManagement />}
                   />
+                  <Route
+                    path="/admin/aptitude-practice"
+                    element={<AdminAptitudePractice />}
+                  />
+
 
                   <Route
                     path="/admin/resumes"
