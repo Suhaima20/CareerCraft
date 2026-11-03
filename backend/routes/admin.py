@@ -1,24 +1,27 @@
-import io
-from datetime import datetime, timezone
+"""CareerCraft administration routes.
 
-from flask import Blueprint, request, jsonify, g, send_file
+Master-data fields support both the current workbook schema and legacy API
+field names. Assessment questions are managed per skill and proficiency level;
+chapter-level quizzes and video-watch requirements are not used by the new flow.
+"""
+
+import io
+import re
+from datetime import datetime, timezone
+from urllib.parse import urlparse
+
+from bson import ObjectId
+from flask import Blueprint, current_app, request, jsonify, g, send_file
 from openpyxl import Workbook, load_workbook
+from pymongo import DeleteOne, InsertOne
 
 from db import get_collection
 from utils.auth import admin_required
 from utils.serialization import serialize_doc, to_objectid
 
-
-# ============================================================
-# ADMIN BLUEPRINT
-# ============================================================
-
 admin_bp = Blueprint("admin", __name__, url_prefix="/admin")
+LEVELS = ("Beginner", "Intermediate", "Advanced")
 
-
-# ============================================================
-# HELPERS
-# ============================================================
 
 def now_utc():
     return datetime.now(timezone.utc)
@@ -28,9 +31,7 @@ def _log_action(action, details=None):
     try:
         get_collection("admin_audit_logs").insert_one({
             "adminId": getattr(g, "current_user_id", None),
-            "action": action,
-            "details": details or {},
-            "createdAt": now_utc(),
+            "action": action, "details": details or {}, "createdAt": now_utc(),
         })
     except Exception:
         pass
@@ -39,19 +40,12 @@ def _log_action(action, details=None):
 def _create_notification(user_id, notification_type, title, message):
     if not user_id:
         return None
-
     try:
-        notification = {
-            "userId": user_id,
-            "type": notification_type,
-            "title": title,
-            "message": message,
-            "read": False,
-            "createdAt": now_utc(),
-        }
-        result = get_collection("notifications").insert_one(notification)
-        notification["_id"] = result.inserted_id
-        return notification
+        doc = {"userId": user_id, "type": notification_type, "title": title,
+               "message": message, "read": False, "createdAt": now_utc()}
+        result = get_collection("notifications").insert_one(doc)
+        doc["_id"] = result.inserted_id
+        return doc
     except Exception:
         return None
 
@@ -59,224 +53,132 @@ def _create_notification(user_id, notification_type, title, message):
 def _cors_response():
     response = jsonify({"status": "ok"})
     response.headers["Access-Control-Allow-Origin"] = "*"
-    response.headers["Access-Control-Allow-Headers"] = (
-        "Content-Type,Authorization,Accept,X-Requested-With"
-    )
-    response.headers["Access-Control-Allow-Methods"] = (
-        "GET,POST,PUT,PATCH,DELETE,OPTIONS"
-    )
+    response.headers["Access-Control-Allow-Headers"] = "Content-Type,Authorization,Accept,X-Requested-With"
+    response.headers["Access-Control-Allow-Methods"] = "GET,POST,PUT,PATCH,DELETE,OPTIONS"
     return response, 200
 
 
-def _valid_object_id(value):
-    if not value:
-        return None
-    try:
-        return to_objectid(value)
-    except Exception:
-        return None
-
-
-def _id_candidates(value):
-    """
-    Support MongoDB ObjectIds and string business IDs
-    such as CA001, SK0101, and CH0101.
-    """
-    candidates = []
-
-    if value is None:
-        return candidates
-
-    value = str(value).strip()
-    if not value:
-        return candidates
-
-    candidates.append(value)
-
-    obj_id = _valid_object_id(value)
-    if obj_id is not None:
-        candidates.append(obj_id)
-
-    # Preserve candidates of different types.
-    # A string ID and its ObjectId representation are not duplicates.
-    unique = []
-    seen = set()
-
-    for item in candidates:
-        key = (type(item), str(item))
-
-        if key not in seen:
-            seen.add(key)
-            unique.append(item)
-
-    return unique
-
-def _reference_query(value, fields):
-    """
-    Build a Mongo query that supports both:
-      - ObjectId references
-      - string business IDs
-
-    Example:
-      _reference_query(career_id, ["_id", "career_id"])
-    """
-    candidates = _id_candidates(value)
-
-    if not candidates:
-        return {"_id": None}
-
-    clauses = []
-
-    for field in fields:
-        for candidate in candidates:
-            clauses.append({field: candidate})
-
-    if len(clauses) == 1:
-        return clauses[0]
-
-    return {"$or": clauses}
-
-
-def _find_by_reference(collection_name, value, fields):
-    if value is None:
-        return None
-
-    return get_collection(collection_name).find_one(
-        _reference_query(value, fields)
-    )
-
-
-def _pagination():
-    try:
-        page = int(request.args.get("page", 1))
-    except (TypeError, ValueError):
-        page = 1
-
-    try:
-        limit = int(request.args.get("limit", 20))
-    except (TypeError, ValueError):
-        limit = 20
-
-    page = max(page, 1)
-    limit = max(min(limit, 100), 1)
-
-    return page, limit
-
-
-def _total_pages(total, limit):
-    return max(1, (total + limit - 1) // limit)
-
-
-def _extract_ref_ids(documents, field_names):
-    """
-    Extract mapping references regardless of whether they are stored as
-    ObjectIds or strings.
-    """
-    values = []
-
-    for doc in documents:
-        for field in field_names:
-            value = doc.get(field)
-            if value is not None and value != "":
-                values.append(value)
-                break
-
-    return values
-
-
-def _find_many_by_references(collection_name, values, fields):
-    """
-    Find documents using ObjectId OR business-ID references.
-    """
-    if not values:
-        return []
-
-    clauses = []
-
-    for value in values:
-        candidates = _id_candidates(value)
-
-        for field in fields:
-            for candidate in candidates:
-                clauses.append({field: candidate})
-
-    if not clauses:
-        return []
-
-    return list(
-        get_collection(collection_name).find(
-            {"$or": clauses}
-        )
-    )
-
-
-def _mapping_reference_matches(mapping, field, target_value):
-    """
-    Used for compatibility with old and new mapping documents.
-    """
-    mapping_value = mapping.get(field)
-
-    if mapping_value is None:
-        return False
-
-    target_candidates = {
-        str(value) for value in _id_candidates(target_value)
-    }
-
-    mapping_candidates = {
-        str(value) for value in _id_candidates(mapping_value)
-    }
-
-    return bool(target_candidates.intersection(mapping_candidates))
-
-
 # ============================================================
-# DASHBOARD STATS
+# CURRENT ADMIN PROFILE
 # ============================================================
 
-@admin_bp.route("/stats", methods=["GET", "OPTIONS"])
+@admin_bp.route("/me", methods=["GET", "OPTIONS"])
 @admin_required
-def get_stats():
+def get_admin_profile():
+    """
+    Return the authenticated administrator's public profile.
+    Used by the frontend to restore an admin session.
+    """
     if request.method == "OPTIONS":
         return _cors_response()
 
-    users = get_collection("users")
-
-    total_users = users.count_documents({
-        "role": {"$ne": "admin"}
-    })
-
-    active_users = users.count_documents({
-        "role": {"$ne": "admin"},
-        "lastActivityDate": {"$ne": None}
-    })
-
-    total_careers = get_collection("careers").count_documents({})
-    total_skills = get_collection("skills").count_documents({})
-    total_chapters = get_collection("chapters").count_documents({})
-    total_resumes = get_collection("resumes").count_documents({})
-    total_feedback = get_collection("feedback").count_documents({})
-    recent_users = list(
-        users.find({"role": {"$ne": "admin"}})
-        .sort("createdAt", -1)
-        .limit(5)
-    )
+    admin = g.current_user
 
     return jsonify({
-        "totalUsers": total_users,
-        "activeUsers": active_users,
-        "totalCareers": total_careers,
-        "totalSkills": total_skills,
-        "totalChapters": total_chapters,
-        "totalResumes": total_resumes,
-        "totalFeedback": total_feedback,
-        "recentUsers": serialize_doc(recent_users),
+        "user": {
+            "_id": str(admin["_id"]),
+            "name": admin.get("name", ""),
+            "email": admin.get("email", ""),
+            "role": admin.get("role", "admin"),
+            "profession": admin.get("profession", ""),
+            "age": admin.get("age"),
+            "phone": admin.get("phone", ""),
+        }
     }), 200
 
 
-# ============================================================
-# USERS
-# ============================================================
+def _id_candidates(value):
+    if value is None or str(value).strip() == "":
+        return []
+    value = str(value).strip()
+    values = [value]
+    try:
+        if ObjectId.is_valid(value):
+            values.append(ObjectId(value))
+    except Exception:
+        pass
+    result, seen = [], set()
+    for item in values:
+        key = (type(item).__name__, str(item))
+        if key not in seen:
+            seen.add(key)
+            result.append(item)
+    return result
+
+
+def _ref_query(value, fields):
+    clauses = [{field: candidate} for field in fields for candidate in _id_candidates(value)]
+    if not clauses:
+        return {"_id": None}
+    return clauses[0] if len(clauses) == 1 else {"$or": clauses}
+
+
+def _find_ref(collection_name, value, fields):
+    if value is None:
+        return None
+    return get_collection(collection_name).find_one(_ref_query(value, fields))
+
+
+def _matches_ref(document, field, target):
+    a = {str(x) for x in _id_candidates(document.get(field))}
+    b = {str(x) for x in _id_candidates(target)}
+    return bool(a & b)
+
+
+def _pagination():
+    try: page = max(1, int(request.args.get("page", 1)))
+    except (TypeError, ValueError): page = 1
+    try: limit = max(1, min(100, int(request.args.get("limit", 20))))
+    except (TypeError, ValueError): limit = 20
+    return page, limit
+
+
+def _pages(total, limit):
+    return max(1, (total + limit - 1) // limit)
+
+
+def _first(doc, *keys, default=None):
+    for key in keys:
+        if doc.get(key) is not None:
+            return doc[key]
+    return default
+
+
+def _active(doc):
+    return bool(_first(doc, "is_active", "isActive", "active", default=True))
+
+
+def _name(doc, kind):
+    fields = {"career": ("career_name", "name", "careerName"),
+              "skill": ("skill_name", "name", "skillName"),
+              "chapter": ("chapter_name", "title", "chapterName")}
+    return _first(doc, *fields[kind], default="")
+
+
+def _safe_regex(value):
+    return re.escape(value.strip())
+
+
+# ------------------------------ dashboard ------------------------------
+@admin_bp.route("/stats", methods=["GET", "OPTIONS"])
+@admin_required
+def get_stats():
+    if request.method == "OPTIONS": return _cors_response()
+    users = get_collection("users")
+    return jsonify({
+        "totalUsers": users.count_documents({"role": {"$ne": "admin"}}),
+        "activeUsers": users.count_documents({"role": {"$ne": "admin"}, "lastActivityDate": {"$ne": None}}),
+        "totalCareers": get_collection("careers").count_documents({}),
+        "totalSkills": get_collection("skills").count_documents({}),
+        "totalChapters": get_collection("chapters").count_documents({}),
+        "totalResumes": get_collection("resumes").count_documents({}),
+        "totalFeedback": get_collection("feedback").count_documents({}),
+        "totalQuestions": get_collection("questions").count_documents({}),
+        "recentUsers": serialize_doc(list(users.find({"role": {"$ne": "admin"}}).sort("createdAt", -1).limit(5))),
+    }), 200
+
+
+# -------------------------------- users ---------------------------------
 
 @admin_bp.route("/users", methods=["GET", "OPTIONS"])
 @admin_required
@@ -291,111 +193,135 @@ def list_users():
 
     if q:
         query["$or"] = [
-            {"name": {"$regex": q, "$options": "i"}},
-            {"email": {"$regex": q, "$options": "i"}},
+            {
+                "name": {
+                    "$regex": _safe_regex(q),
+                    "$options": "i"
+                }
+            },
+            {
+                "email": {
+                    "$regex": _safe_regex(q),
+                    "$options": "i"
+                }
+            }
         ]
 
-    users_collection = get_collection("users")
-    total = users_collection.count_documents(query)
+    coll = get_collection("users")
+    total = coll.count_documents(query)
 
-    users = list(
-        users_collection.find(query)
+    docs = list(
+        coll.find(query)
         .sort("createdAt", -1)
         .skip((page - 1) * limit)
         .limit(limit)
     )
 
+    # Older accounts without a status field are treated as active.
+    for user in docs:
+        if (
+            "is_active" not in user
+            and "isActive" not in user
+            and "active" not in user
+        ):
+            user["is_active"] = True
+
     return jsonify({
-        "users": serialize_doc(users),
+        "users": serialize_doc(docs),
         "total": total,
         "page": page,
         "limit": limit,
-        "totalPages": _total_pages(total, limit),
+        "totalPages": _pages(total, limit)
     }), 200
 
 
 @admin_bp.route(
     "/users/<user_id>",
-    methods=["GET", "PUT", "DELETE", "OPTIONS"]
+    methods=["GET", "PUT", "OPTIONS"]
 )
 @admin_required
-def handle_user_by_id(user_id):
+def user_by_id(user_id):
     if request.method == "OPTIONS":
         return _cors_response()
 
-    user_obj_id = _valid_object_id(user_id)
-
-    if user_obj_id is None:
+    if not ObjectId.is_valid(user_id):
         return jsonify({"error": "Invalid user ID"}), 400
 
-    users = get_collection("users")
-    user = users.find_one({"_id": user_obj_id})
+    oid = ObjectId(user_id)
+    coll = get_collection("users")
+    user = coll.find_one({"_id": oid})
 
-    if user is None:
+    if not user:
         return jsonify({"error": "User not found"}), 404
 
+    if user.get("role") == "admin":
+        return jsonify({
+            "error": "Admin accounts cannot be managed here"
+        }), 403
+
     if request.method == "GET":
-        user_skills_doc = get_collection("user_skills").find_one({
-            "userId": user_obj_id
-        })
+        user_skills = get_collection(
+            "user_skills"
+        ).find_one({"userId": oid}) or {}
 
-        skill_ids = []
+        ids = [
+            x.get("skillId") if isinstance(x, dict) else x
+            for x in user_skills.get("skills", [])
+        ]
 
-        if user_skills_doc:
-            for entry in user_skills_doc.get("skills", []):
-                if isinstance(entry, dict):
-                    skill_id = entry.get("skillId")
-                    if skill_id:
-                        skill_ids.append(skill_id)
-                else:
-                    skill_ids.append(entry)
-
-        skills = _find_many_by_references(
-            "skills",
-            skill_ids,
-            ["_id", "skill_id", "skillId"]
+        user["skills"] = (
+            list(
+                get_collection("skills").find(
+                    _ref_query_many(
+                        ids,
+                        ["_id", "skill_id", "skillId"]
+                    )
+                )
+            )
+            if ids else []
         )
 
-        user["skills"] = skills
+        career_id = user.get("activeCareerId")
 
-        active_career_id = user.get("activeCareerId")
-
-        if active_career_id:
-            career = _find_by_reference(
+        career = (
+            _find_ref(
                 "careers",
-                active_career_id,
+                career_id,
                 ["_id", "career_id", "careerId"]
             )
-            print("\n========== CAREER LOOKUP DEBUG ==========")
-            print("Requested career ID:", repr(active_career_id))
-            print("Database name:", get_collection("careers").database.name)
-            print("Career found:", career is not None)
+            if career_id else None
+        )
 
-            if career is not None:
-                print("Career document ID:", repr(career.get("_id")))
-                print("Career name:", career.get("name"))
+        user["activeCareerName"] = (
+            _name(career, "career") if career else None
+        )
 
-            print("=========================================\n")
-            user["activeCareerName"] = (
-                career.get("name") if career else None
-            )
+        if (
+            "is_active" not in user
+            and "isActive" not in user
+            and "active" not in user
+        ):
+            user["is_active"] = True
 
-        return jsonify({"user": serialize_doc(user)}), 200
+        return jsonify({
+            "user": serialize_doc(user)
+        }), 200
 
     if request.method == "PUT":
         data = request.get_json(silent=True) or {}
 
-        allowed = ["name", "age", "phone", "profession", "role"]
-        update = {}
+        allowed = (
+            "name",
+            "age",
+            "phone",
+            "profession"
+        )
 
-        for key in allowed:
-            if key not in data:
-                continue
-
-            if key == "role" and data[key] != "user":
-                continue
-
-            update[key] = data[key]
+        update = {
+            key: data[key]
+            for key in allowed
+            if key in data
+        }
 
         if not update:
             return jsonify({
@@ -404,2159 +330,1114 @@ def handle_user_by_id(user_id):
 
         update["updatedAt"] = now_utc()
 
-        users.update_one(
-            {"_id": user_obj_id},
+        coll.update_one(
+            {"_id": oid},
             {"$set": update}
         )
 
         _log_action(
             "update_user",
-            {"userId": user_id, "fields": list(update.keys())}
+            {
+                "userId": user_id,
+                "fields": list(update.keys())
+            }
         )
 
         return jsonify({"updated": True}), 200
 
-    if user.get("role") == "admin":
-        return jsonify({
-            "error": "Admin accounts cannot be deleted here"
-        }), 403
-
-    users.delete_one({"_id": user_obj_id})
-
-    user_related_collections = [
-        "user_skills",
-        "roadmap_progress",
-        "skill_gap_analyses",
-        "resume_analysis",
-        "resumes",
-        "achievements",
-        "notifications",
-        "study_reminders",
-        "saved_jobs",
-        "resume_builder",
-        "career_progress",
-    ]
-
-    for collection_name in user_related_collections:
-        try:
-            get_collection(collection_name).delete_many({
-                "userId": user_obj_id
-            })
-        except Exception:
-            pass
-
-    _log_action("delete_user", {"userId": user_id})
-
-    return jsonify({"deleted": True}), 200
-
 
 # ============================================================
-# CAREERS
+# DEACTIVATE / REACTIVATE STUDENT ACCOUNT
 # ============================================================
 
-@admin_bp.route("/careers", methods=["GET", "POST", "OPTIONS"])
+@admin_bp.route(
+    "/users/<user_id>/status",
+    methods=["PATCH", "OPTIONS"]
+)
 @admin_required
-def handle_careers():
+def update_user_status(user_id):
     if request.method == "OPTIONS":
         return _cors_response()
 
-    careers = get_collection("careers")
-
-    if request.method == "GET":
-        q = (request.args.get("q") or "").strip()
-        query = {}
-
-        if q:
-            query["$or"] = [
-                {"name": {"$regex": q, "$options": "i"}},
-                {"career_id": {"$regex": q, "$options": "i"}},
-                {"careerId": {"$regex": q, "$options": "i"}},
-            ]
-
-        data = list(
-            careers.find(query).sort("name", 1)
-        )
-
+    if not ObjectId.is_valid(user_id):
         return jsonify({
-            "careers": serialize_doc(data)
-        }), 200
+            "error": "Invalid user ID"
+        }), 400
 
     data = request.get_json(silent=True) or {}
-    name = (data.get("name") or "").strip()
 
-    if not name:
-        return jsonify({"error": "Career name is required"}), 400
+    # Accept only an explicit boolean.
+    if not isinstance(data.get("isActive"), bool):
+        return jsonify({
+            "error": "isActive must be true or false"
+        }), 400
 
-    existing = careers.find_one({
-        "name": {"$regex": f"^{name}$", "$options": "i"}
-    })
+    oid = ObjectId(user_id)
+    coll = get_collection("users")
 
-    if existing:
-        return jsonify({"error": "Career already exists"}), 409
+    user = coll.find_one({"_id": oid})
 
+    if not user:
+        return jsonify({
+            "error": "User not found"
+        }), 404
+
+    # Never allow this endpoint to change administrator accounts.
+    if user.get("role") == "admin":
+        return jsonify({
+            "error": "Administrator accounts cannot be changed here"
+        }), 403
+
+    is_active = data["isActive"]
     now = now_utc()
 
-    doc = {
-        "name": name,
-        "career_id": data.get("career_id") or data.get("careerId"),
-        "description": data.get("description", ""),
-        "active": bool(data.get("active", True)),
-        "status": data.get("status") or ("published" if data.get("active", True) else "draft"),
-        "createdAt": now,
-        "updatedAt": now,
-    }
-
-    result = careers.insert_one(doc)
-    doc["_id"] = result.inserted_id
-
-    _log_action(
-        "create_career",
-        {"careerId": str(result.inserted_id)}
+    coll.update_one(
+        {"_id": oid},
+        {
+            "$set": {
+                "is_active": is_active,
+                "isActive": is_active,
+                "active": is_active,
+                "updatedAt": now,
+                "accountStatusUpdatedAt": now
+            }
+        }
     )
 
+    updated_user = coll.find_one({"_id": oid})
+
+    _log_action(
+        "reactivate_user" if is_active else "deactivate_user",
+        {
+            "userId": user_id
+        }
+    )
+
+    return jsonify({
+        "message": (
+            "User account reactivated successfully"
+            if is_active
+            else "User account deactivated successfully"
+        ),
+        "user": serialize_doc(updated_user)
+    }), 200
+
+def _ref_query_many(values, fields):
+    return _find_ref_many_query(values, fields)
+
+
+# -------------------------- career/skill/chapter -------------------------
+@admin_bp.route("/careers", methods=["GET", "POST", "OPTIONS"])
+@admin_required
+def careers_collection():
+    if request.method == "OPTIONS": return _cors_response()
+    coll = get_collection("careers")
+    if request.method == "GET":
+        q = (request.args.get("q") or "").strip(); query = {}
+        if q: query["$or"] = [{k: {"$regex": _safe_regex(q), "$options": "i"}} for k in ("career_name", "name", "career_id", "careerId")]
+        docs = list(coll.find(query))
+        docs.sort(key=lambda d: _name(d, "career").lower())
+        return jsonify({"careers": serialize_doc(docs)}), 200
+    data = request.get_json(silent=True) or {}; name = (data.get("career_name") or data.get("name") or data.get("careerName") or "").strip()
+    if not name: return jsonify({"error": "Career name is required"}), 400
+    if coll.find_one({"$or": [{k: {"$regex": f"^{_safe_regex(name)}$", "$options": "i"}} for k in ("career_name", "name", "careerName")]}): return jsonify({"error": "Career already exists"}), 409
+    now = now_utc(); active = bool(data.get("is_active", data.get("active", True)))
+    doc = {"career_id": data.get("career_id") or data.get("careerId"), "career_name": name, "name": name, "description": data.get("description", ""), "is_active": active, "active": active, "createdAt": now, "updatedAt": now}
+    res = coll.insert_one(doc); doc["_id"] = res.inserted_id; _log_action("create_career", {"careerId": str(res.inserted_id)})
     return jsonify(serialize_doc(doc)), 201
 
 
-@admin_bp.route(
-    "/careers/<career_id>",
-    methods=["GET", "PUT", "DELETE", "OPTIONS"]
-)
+@admin_bp.route("/careers/<career_id>", methods=["GET", "PUT", "DELETE", "OPTIONS"])
 @admin_required
-def handle_career_by_id(career_id):
-    if request.method == "OPTIONS":
-        return _cors_response()
-
-    career = _find_by_reference(
-        "careers",
-        career_id,
-        ["_id", "career_id", "careerId"]
-    )
-
-    if career is None:
-        return jsonify({"error": "Career not found"}), 404
-
-    if request.method == "GET":
-        return jsonify({
-            "career": serialize_doc(career)
-        }), 200
-
+def career_by_id(career_id):
+    if request.method == "OPTIONS": return _cors_response()
+    coll = get_collection("careers"); doc = _find_ref("careers", career_id, ["_id", "career_id", "careerId"])
+    if not doc: return jsonify({"error": "Career not found"}), 404
+    if request.method == "GET": return jsonify({"career": serialize_doc(doc)}), 200
     if request.method == "PUT":
-        data = request.get_json(silent=True) or {}
-
-        allowed = [
-            "name",
-            "career_id",
-            "description",
-            "active",
-            "status"
-        ]
-
-        update = {
-            key: data[key]
-            for key in allowed
-            if key in data
-        }
-        if "active" in update and "status" not in update:
-            update["status"] = "published" if update["active"] else "draft"
-        if "status" in update and "active" not in update:
-            update["active"] = update["status"] == "published"
-
-        if not update:
-            return jsonify({
-                "error": "No valid fields to update"
-            }), 400
-
-        update["updatedAt"] = now_utc()
-
-        get_collection("careers").update_one(
-            {"_id": career["_id"]},
-            {"$set": update}
-        )
-
-        _log_action(
-            "update_career",
-            {"careerId": str(career["_id"])}
-        )
-
-        return jsonify({"updated": True}), 200
-
-    get_collection("careers").delete_one({
-        "_id": career["_id"]
-    })
-
-    # Remove mappings regardless of whether old mappings use ObjectId
-    # or business-ID strings.
-    mappings = list(
-        get_collection("career_skill_mapping").find({})
-    )
-
-    for mapping in mappings:
-        if _mapping_reference_matches(
-            mapping,
-            "careerId",
-            career.get("_id")
-        ) or _mapping_reference_matches(
-            mapping,
-            "careerId",
-            career.get("career_id")
-        ):
-            get_collection("career_skill_mapping").delete_one({
-                "_id": mapping["_id"]
+        data = request.get_json(silent=True) or {}; update = {}
+        career_id = _first(data, "career_id", "careerId")
+        existing_career_id = _first(doc, "career_id", "careerId")
+        if career_id is not None and str(career_id).strip() != str(existing_career_id or "").strip():
+            return jsonify({"error": "Career ID cannot be changed after creation"}), 400
+        if "description" in data: update["description"] = data["description"]
+        if any(k in data for k in ("career_name", "careerName", "name")):
+            value = (data.get("career_name") or data.get("careerName") or data.get("name") or "").strip()
+            if not value: return jsonify({"error": "Career name cannot be empty"}), 400
+            duplicate = coll.find_one({
+                "_id": {"$ne": doc["_id"]},
+                "$or": [{k: {"$regex": f"^{_safe_regex(value)}$", "$options": "i"}} for k in ("career_name", "name", "careerName")],
             })
-
-    _log_action(
-        "delete_career",
-        {"careerId": career_id}
+            if duplicate: return jsonify({"error": "Career already exists"}), 409
+            update.update({"career_name": value, "name": value})
+        if "is_active" in data or "active" in data:
+            value = bool(data.get("is_active", data.get("active"))); update.update({"is_active": value, "active": value})
+        if not update: return jsonify({"error": "No valid fields to update"}), 400
+        update["updatedAt"] = now_utc(); coll.update_one({"_id": doc["_id"]}, {"$set": update}); _log_action("update_career", {"careerId": str(doc["_id"])})
+        return jsonify({"updated": True}), 200
+    career_refs = [value for value in (doc.get("_id"), doc.get("career_id"), doc.get("careerId")) if value is not None]
+    related_collections = (
+        ("career_skill_mapping", ("careerId", "career_id")),
+        ("career_chapter_mapping", ("careerId", "career_id")),
+        ("career_progress", ("careerId", "career_id")),
+        ("roadmap_progress", ("careerId", "career_id")),
+        ("skill_assessments", ("careerId", "career_id")),
+        ("assessment_attempts", ("careerId", "career_id")),
+        ("users", ("activeCareerId",)),
     )
+    if any(_has_related_reference(name, career_refs, fields) for name, fields in related_collections):
+        return jsonify({"error": "Career has related mappings or learner progress. Deactivate it instead of deleting it."}), 409
+    coll.delete_one({"_id": doc["_id"]})
+    _log_action("delete_career", {"careerId": career_id}); return jsonify({"deleted": True}), 200
 
-    return jsonify({"deleted": True}), 200
-
-
-# ============================================================
-# SKILLS
-# ============================================================
 
 @admin_bp.route("/skills", methods=["GET", "POST", "OPTIONS"])
 @admin_required
-def handle_skills():
-    if request.method == "OPTIONS":
-        return _cors_response()
-
-    skills = get_collection("skills")
-
+def skills_collection():
+    if request.method == "OPTIONS": return _cors_response()
+    coll = get_collection("skills")
     if request.method == "GET":
-        q = (request.args.get("q") or "").strip()
-        query = {}
-
-        if q:
-            query["$or"] = [
-                {"name": {"$regex": q, "$options": "i"}},
-                {"skill_id": {"$regex": q, "$options": "i"}},
-                {"skillId": {"$regex": q, "$options": "i"}},
-            ]
-
-        data = list(
-            skills.find(query).sort("name", 1)
-        )
-
-        return jsonify({
-            "skills": serialize_doc(data)
-        }), 200
-
-    data = request.get_json(silent=True) or {}
-    name = (data.get("name") or "").strip()
-
-    if not name:
-        return jsonify({"error": "Skill name is required"}), 400
-
-    existing = skills.find_one({
-        "name": {"$regex": f"^{name}$", "$options": "i"}
-    })
-
-    if existing:
-        return jsonify({"error": "Skill already exists"}), 409
-
-    now = now_utc()
-
-    doc = {
-        "name": name,
-        "skill_id": data.get("skill_id") or data.get("skillId"),
-        "category": data.get("category", ""),
-        "description": data.get("description", ""),
-        "active": data.get("active", True),
-        "createdAt": now,
-        "updatedAt": now,
-    }
-
-    result = skills.insert_one(doc)
-    doc["_id"] = result.inserted_id
-
-    _log_action(
-        "create_skill",
-        {"skillId": str(result.inserted_id)}
-    )
-
-    return jsonify(serialize_doc(doc)), 201
+        q = (request.args.get("q") or "").strip(); query = {}
+        if q: query["$or"] = [{k: {"$regex": _safe_regex(q), "$options": "i"}} for k in ("skill_name", "name", "skill_id", "skillId")]
+        docs = list(coll.find(query)); docs.sort(key=lambda d: _name(d, "skill").lower())
+        return jsonify({"skills": serialize_doc(docs)}), 200
+    data = request.get_json(silent=True) or {}; name = (data.get("skill_name") or data.get("name") or data.get("skillName") or "").strip()
+    if not name: return jsonify({"error": "Skill name is required"}), 400
+    duplicate = coll.find_one({"$or": [{k: {"$regex": f"^{_safe_regex(name)}$", "$options": "i"}} for k in ("skill_name", "name", "skillName")]})
+    if duplicate: return jsonify({"error": "Skill already exists"}), 409
+    active = bool(data.get("is_active", data.get("active", True))); now = now_utc()
+    doc = {"skill_id": data.get("skill_id") or data.get("skillId"), "skill_name": name, "name": name, "description": data.get("description", ""), "skill_category": data.get("skill_category", data.get("category", "")), "category": data.get("category", data.get("skill_category", "")), "is_active": active, "active": active, "createdAt": now, "updatedAt": now}
+    result = coll.insert_one(doc); doc["_id"] = result.inserted_id; _log_action("create_skill", {"skillId": str(result.inserted_id)}); return jsonify(serialize_doc(doc)), 201
 
 
-@admin_bp.route(
-    "/skills/<skill_id>",
-    methods=["PUT", "DELETE", "OPTIONS"]
-)
+@admin_bp.route("/skills/<skill_id>", methods=["GET", "PUT", "DELETE", "OPTIONS"])
 @admin_required
-def handle_skill_by_id(skill_id):
-    if request.method == "OPTIONS":
-        return _cors_response()
-
-    skill = _find_by_reference(
-        "skills",
-        skill_id,
-        ["_id", "skill_id", "skillId"]
-    )
-
-    if skill is None:
-        return jsonify({"error": "Skill not found"}), 404
-
+def skill_by_id(skill_id):
+    if request.method == "OPTIONS": return _cors_response()
+    coll = get_collection("skills"); doc = _find_ref("skills", skill_id, ["_id", "skill_id", "skillId"])
+    if not doc: return jsonify({"error": "Skill not found"}), 404
+    if request.method == "GET": return jsonify({"skill": serialize_doc(doc)}), 200
     if request.method == "PUT":
-        data = request.get_json(silent=True) or {}
-
-        allowed = [
-            "name",
-            "skill_id",
-            "category",
-            "description",
-            "active"
-        ]
-
-        update = {
-            key: data[key]
-            for key in allowed
-            if key in data
-        }
-
-        if not update:
-            return jsonify({
-                "error": "No valid fields to update"
-            }), 400
-
-        update["updatedAt"] = now_utc()
-
-        get_collection("skills").update_one(
-            {"_id": skill["_id"]},
-            {"$set": update}
-        )
-
-        _log_action(
-            "update_skill",
-            {"skillId": str(skill["_id"])}
-        )
-
+        data = request.get_json(silent=True) or {}; update = {}
+        skill_id = _first(data, "skill_id", "skillId")
+        existing_skill_id = _first(doc, "skill_id", "skillId")
+        if skill_id is not None and str(skill_id).strip() != str(existing_skill_id or "").strip():
+            return jsonify({"error": "Skill ID cannot be changed after creation"}), 400
+        if any(k in data for k in ("skill_name", "skillName", "name")):
+            name = (data.get("skill_name") or data.get("skillName") or data.get("name") or "").strip()
+            if not name: return jsonify({"error": "Skill name cannot be empty"}), 400
+            duplicate = coll.find_one({
+                "_id": {"$ne": doc["_id"]},
+                "$or": [{k: {"$regex": f"^{_safe_regex(name)}$", "$options": "i"}} for k in ("skill_name", "name", "skillName")],
+            })
+            if duplicate: return jsonify({"error": "Skill already exists"}), 409
+            update.update({"skill_name": name, "name": name})
+        if "description" in data: update["description"] = data["description"]
+        if "skill_category" in data or "category" in data:
+            value = data.get("skill_category", data.get("category", "")); update.update({"skill_category": value, "category": value})
+        if "is_active" in data or "active" in data:
+            value = bool(data.get("is_active", data.get("active"))); update.update({"is_active": value, "active": value})
+        if not update: return jsonify({"error": "No valid fields to update"}), 400
+        update["updatedAt"] = now_utc(); coll.update_one({"_id": doc["_id"]}, {"$set": update}); _log_action("update_skill", {"skillId": str(doc["_id"])})
         return jsonify({"updated": True}), 200
-
-    get_collection("skills").delete_one({
-        "_id": skill["_id"]
-    })
-
-    for collection_name, field in [
-        ("skill_chapter_mapping", "skillId"),
-        ("career_skill_mapping", "skillId"),
-    ]:
-        mappings = list(
-            get_collection(collection_name).find({})
-        )
-
-        for mapping in mappings:
-            if (
-                _mapping_reference_matches(
-                    mapping,
-                    field,
-                    skill.get("_id")
-                )
-                or _mapping_reference_matches(
-                    mapping,
-                    field,
-                    skill.get("skill_id")
-                )
-            ):
-                get_collection(collection_name).delete_one({
-                    "_id": mapping["_id"]
-                })
-
-    _log_action(
-        "delete_skill",
-        {"skillId": skill_id}
+    skill_refs = [value for value in (doc.get("_id"), doc.get("skill_id"), doc.get("skillId")) if value is not None]
+    related_collections = (
+        ("skill_chapter_mapping", ("skillId", "skill_id")),
+        ("career_skill_mapping", ("skillId", "skill_id")),
+        ("chapters", ("skillId", "skill_id", "skillID")),
+        ("questions", ("skillId", "skill_id")),
+        ("skill_assessments", ("skillId", "skill_id")),
+        ("assessment_attempts", ("skillId", "skill_id")),
+        ("user_skills", ("skillId", "skill_id", "skills.skillId", "skills.skill_id", "skills")),
     )
+    if any(_has_related_reference(name, skill_refs, fields) for name, fields in related_collections):
+        return jsonify({"error": "Skill has chapters, mappings, or learner assessment data. Deactivate it instead of deleting it."}), 409
+    coll.delete_one({"_id": doc["_id"]})
+    _log_action("delete_skill", {"skillId": skill_id}); return jsonify({"deleted": True}), 200
 
-    return jsonify({"deleted": True}), 200
-
-
-# ============================================================
-# CHAPTERS
-# ============================================================
 
 @admin_bp.route("/chapters", methods=["GET", "POST", "OPTIONS"])
 @admin_required
-def handle_chapters():
-    if request.method == "OPTIONS":
-        return _cors_response()
-
-    chapters = get_collection("chapters")
-
+def chapters_collection():
+    if request.method == "OPTIONS": return _cors_response()
+    coll = get_collection("chapters")
     if request.method == "GET":
-        q = (request.args.get("q") or "").strip()
-        query = {}
-
-        if q:
-            query["$or"] = [
-                {"title": {"$regex": q, "$options": "i"}},
-                {"description": {"$regex": q, "$options": "i"}},
-                {"chapter_id": {"$regex": q, "$options": "i"}},
-                {"chapterId": {"$regex": q, "$options": "i"}},
-            ]
-
-        data = list(
-            chapters.find(query).sort([
-                ("order", 1),
-                ("createdAt", 1)
-            ])
-        )
-
-        return jsonify({
-            "chapters": serialize_doc(data)
-        }), 200
-
-    data = request.get_json(silent=True) or {}
-    title = (data.get("title") or "").strip()
-
-    if not title:
-        return jsonify({
-            "error": "Chapter title is required"
-        }), 400
-
+        q = (request.args.get("q") or "").strip(); query = {}
+        if q: query["$or"] = [{k: {"$regex": _safe_regex(q), "$options": "i"}} for k in ("chapter_name", "title", "chapter_id", "chapterId", "skillName")]
+        docs = list(coll.find(query))
+        skills = list(get_collection("skills").find({}))
+        skills_by_ref = {
+            str(ref): skill
+            for skill in skills
+            for ref in (skill.get("_id"), skill.get("skill_id"), skill.get("skillId"))
+            if ref is not None
+        }
+        chapter_skill_refs = {}
+        for mapping in get_collection("skill_chapter_mapping").find({}):
+            chapter_ref = _first(mapping, "chapterId", "chapter_id")
+            skill_ref = _first(mapping, "skillId", "skill_id")
+            if chapter_ref is not None and skill_ref is not None:
+                chapter_skill_refs.setdefault(str(chapter_ref), skill_ref)
+        for chapter in docs:
+            skill_ref = _first(chapter, "skillId", "skill_id", "skillID")
+            if skill_ref is None:
+                skill_ref = next(
+                    (
+                        chapter_skill_refs[str(ref)]
+                        for ref in (chapter.get("_id"), chapter.get("chapter_id"), chapter.get("chapterId"))
+                        if ref is not None and str(ref) in chapter_skill_refs
+                    ),
+                    None,
+                )
+            skill = skills_by_ref.get(str(skill_ref))
+            if skill:
+                chapter["skillId"] = skill["_id"]
+                chapter["skillName"] = _name(skill, "skill")
+        docs.sort(key=lambda d: (_first(d, "chapter_order", "order", default=0) or 0, _name(d, "chapter").lower()))
+        return jsonify({"chapters": serialize_doc(docs)}), 200
+    data = request.get_json(silent=True) or {}; title = str(data.get("chapter_name") or data.get("title") or data.get("chapterName") or "").strip()
+    if not title: return jsonify({"error": "Chapter title is required"}), 400
+    skill_ref = data.get("skillId", data.get("skill_id"))
+    skill = _find_ref("skills", skill_ref, ["_id", "skill_id", "skillId"]) if skill_ref is not None else None
+    if not skill: return jsonify({"error": "A valid skillId is required for every chapter"}), 400
+    level = _normalize_level(data.get("proficiency_level", data.get("proficiencyLevel", "Beginner")))
+    if not level: return jsonify({"error": "Invalid proficiency level", "allowedLevels": list(LEVELS)}), 400
+    active, error = _chapter_active(data.get("is_active", data.get("active", True)))
+    if error: return jsonify({"error": error}), 400
+    order, error = _chapter_order(data.get("chapter_order", data.get("order", 0)))
+    if error: return jsonify({"error": error}), 400
+    link, error = _chapter_link(data.get("link", data.get("youtubeUrl", "")))
+    if error: return jsonify({"error": error}), 400
     now = now_utc()
-
-    doc = {
-        "title": title,
-        "chapter_id": data.get("chapter_id") or data.get("chapterId"),
-        "description": data.get("description", ""),
-        "youtubeUrl": data.get("youtubeUrl", ""),
-        "duration": data.get("duration", ""),
-        "order": data.get("order", 0),
-        "active": data.get("active", True),
-        "createdAt": now,
-        "updatedAt": now,
-    }
-
-    result = chapters.insert_one(doc)
-    doc["_id"] = result.inserted_id
-
-    _log_action(
-        "create_chapter",
-        {"chapterId": str(result.inserted_id)}
-    )
-
+    doc = {"chapter_id": data.get("chapter_id") or data.get("chapterId"), "chapter_name": title, "title": title, "description": data.get("description", ""), "link": link, "youtubeUrl": link, "chapter_order": order, "order": order, "skillId": skill["_id"], "skill_id": skill.get("skill_id", skill["_id"]), "skillName": _name(skill, "skill"), "proficiency_level": level.upper(), "proficiencyLevel": level, "is_active": active, "active": active, "createdAt": now, "updatedAt": now}
+    res = coll.insert_one(doc); doc["_id"] = res.inserted_id
+    _sync_skill_chapter_mapping(doc, skill, order)
+    _log_action("create_chapter", {"chapterId": str(res.inserted_id), "skillId": str(skill["_id"]), "proficiencyLevel": level})
     return jsonify(serialize_doc(doc)), 201
 
 
-@admin_bp.route(
-    "/chapters/<chapter_id>",
-    methods=["PUT", "DELETE", "OPTIONS"]
-)
+def _chapter_order(value):
+    if isinstance(value, bool):
+        return None, "Chapter order must be a non-negative whole number"
+    try:
+        order = int(value)
+    except (TypeError, ValueError, OverflowError):
+        return None, "Chapter order must be a non-negative whole number"
+    if order < 0 or str(value).strip() not in (str(order), f"{order}.0"):
+        return None, "Chapter order must be a non-negative whole number"
+    return order, None
+
+
+def _chapter_active(value):
+    if isinstance(value, bool):
+        return value, None
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in ("true", "1"):
+            return True, None
+        if normalized in ("false", "0"):
+            return False, None
+    if value in (0, 1):
+        return bool(value), None
+    return None, "Chapter active status must be a boolean"
+
+
+def _chapter_link(value):
+    if value is None:
+        return "", None
+    if not isinstance(value, str):
+        return None, "Chapter learning link must be a URL"
+    link = value.strip()
+    if not link:
+        return "", None
+    try:
+        parsed = urlparse(link)
+    except ValueError:
+        return None, "Chapter learning link must be a valid http:// or https:// URL"
+    if parsed.scheme not in ("http", "https") or not parsed.netloc:
+        return None, "Chapter learning link must be a valid http:// or https:// URL"
+    return link, None
+
+
+def _sync_skill_chapter_mapping(chapter, skill, order):
+    """Keep the workbook-era mapping collection aligned with the chapter owner."""
+    collection = get_collection("skill_chapter_mapping")
+    chapter_refs = [
+        value for value in (chapter.get("_id"), chapter.get("chapter_id"), chapter.get("chapterId"))
+        if value is not None
+    ]
+    query = _find_ref_many_query(chapter_refs, ["chapterId", "chapter_id"])
+    mappings = list(collection.find(query))
+    mapping_fields = {
+        "skillId": skill["_id"],
+        "chapterId": chapter["_id"],
+        "skill_id": skill.get("skill_id", skill["_id"]),
+        "chapter_id": chapter.get("chapter_id", chapter["_id"]),
+        "order": order,
+        "updatedAt": now_utc(),
+    }
+    if mappings:
+        for mapping in mappings:
+            collection.update_one({"_id": mapping["_id"]}, {"$set": mapping_fields})
+        return
+    mapping_fields["createdAt"] = mapping_fields["updatedAt"]
+    collection.insert_one(mapping_fields)
+
+
+@admin_bp.route("/chapters/<chapter_id>", methods=["GET", "PUT", "DELETE", "OPTIONS"])
 @admin_required
-def handle_chapter_by_id(chapter_id):
-    if request.method == "OPTIONS":
-        return _cors_response()
-
-    chapter = _find_by_reference(
-        "chapters",
-        chapter_id,
-        ["_id", "chapter_id", "chapterId"]
-    )
-
-    if chapter is None:
-        return jsonify({"error": "Chapter not found"}), 404
-
+def chapter_by_id(chapter_id):
+    if request.method == "OPTIONS": return _cors_response()
+    coll = get_collection("chapters"); doc = _find_ref("chapters", chapter_id, ["_id", "chapter_id", "chapterId"])
+    if not doc: return jsonify({"error": "Chapter not found"}), 404
+    if request.method == "GET": return jsonify({"chapter": serialize_doc(doc)}), 200
     if request.method == "PUT":
-        data = request.get_json(silent=True) or {}
+        data = request.get_json(silent=True) or {}; update = {}
+        if any(k in data for k in ("chapter_name", "chapterName", "title")):
+            title = str(data.get("chapter_name") or data.get("chapterName") or data.get("title") or "").strip()
+            if not title: return jsonify({"error": "Chapter title cannot be empty"}), 400
+            update.update({"chapter_name": title, "title": title})
+        chapter_id = _first(data, "chapter_id", "chapterId")
+        existing_chapter_id = _first(doc, "chapter_id", "chapterId")
+        if chapter_id is not None and str(chapter_id).strip() != str(existing_chapter_id or "").strip():
+            return jsonify({"error": "Chapter ID cannot be changed after creation"}), 400
+        for key in ("description", "start_timestamp"):
+            if key in data: update[key] = data[key]
+        if "skillId" in data or "skill_id" in data:
+            skill = _find_ref("skills", data.get("skillId", data.get("skill_id")), ["_id", "skill_id", "skillId"])
+            if not skill: return jsonify({"error": "Skill not found"}), 400
+            update.update({"skillId": skill["_id"], "skill_id": skill.get("skill_id", skill["_id"]), "skillName": _name(skill, "skill")})
+        if "link" in data or "youtubeUrl" in data:
+            value, error = _chapter_link(data.get("link", data.get("youtubeUrl", "")))
+            if error: return jsonify({"error": error}), 400
+            update.update({"link": value, "youtubeUrl": value})
+        if "chapter_order" in data or "order" in data:
+            value, error = _chapter_order(data.get("chapter_order", data.get("order", 0)))
+            if error: return jsonify({"error": error}), 400
+            update.update({"chapter_order": value, "order": value})
+        if "proficiency_level" in data or "proficiencyLevel" in data:
+            level = _normalize_level(data.get("proficiency_level", data.get("proficiencyLevel")))
+            if not level: return jsonify({"error": "Invalid proficiency level", "allowedLevels": list(LEVELS)}), 400
+            update.update({"proficiency_level": level.upper(), "proficiencyLevel": level})
+        if "is_active" in data or "active" in data:
+            value, error = _chapter_active(data.get("is_active", data.get("active")))
+            if error: return jsonify({"error": error}), 400
+            update.update({"is_active": value, "active": value})
+        if not update: return jsonify({"error": "No valid fields to update"}), 400
+        update["updatedAt"] = now_utc(); coll.update_one({"_id": doc["_id"]}, {"$set": update})
+        updated_chapter = {**doc, **update}
+        skill = _find_ref("skills", _first(updated_chapter, "skillId", "skill_id", "skillID"), ["_id", "skill_id", "skillId"])
+        if skill and updated_chapter.get("_id") is not None:
+            _sync_skill_chapter_mapping(
+                updated_chapter,
+                skill,
+                _first(updated_chapter, "chapter_order", "order", default=0),
+            )
+        _log_action("update_chapter", {"chapterId": str(doc["_id"])})
+        return jsonify({"updated": True}), 200
+    chapter_refs = [value for value in (doc.get("_id"), doc.get("chapter_id"), doc.get("chapterId")) if value is not None]
+    related_collections = (
+        ("skill_chapter_mapping", ("chapterId", "chapter_id")),
+        ("career_chapter_mapping", ("chapterId", "chapter_id")),
+        ("questions", ("chapterId", "chapter_id")),
+        ("roadmap_progress", ("chapterId", "chapter_id")),
+        ("assessment_attempts", ("chapterId", "chapter_id")),
+    )
+    if any(_has_related_reference(name, chapter_refs, fields) for name, fields in related_collections):
+        return jsonify({"error": "Chapter has mappings, assessment questions, or learner progress. Deactivate it instead of deleting it."}), 409
+    coll.delete_one({"_id": doc["_id"]})
+    _log_action("delete_chapter", {"chapterId": chapter_id}); return jsonify({"deleted": True}), 200
 
-        allowed = [
-            "title",
-            "chapter_id",
-            "description",
-            "youtubeUrl",
-            "duration",
-            "order",
-            "active"
+
+# ------------------------------ mappings --------------------------------
+@admin_bp.route("/mappings/career-skills/<career_id>", methods=["GET", "PUT", "OPTIONS"])
+@admin_required
+def career_skill_mapping(career_id):
+    if request.method == "OPTIONS": return _cors_response()
+    career = _find_ref("careers", career_id, ["_id", "career_id", "careerId"])
+    if not career: return jsonify({"error": "Career not found"}), 404
+    coll = get_collection("career_skill_mapping")
+    refs = [x for x in (career.get("_id"), career.get("career_id"), career.get("careerId"), career_id) if x is not None]
+    query = _find_ref_many_query(refs, ["careerId", "career_id"])
+    if request.method == "GET":
+        mappings = list(coll.find(query).sort([("order", 1), ("_id", 1)])); skills = []; seen = set()
+        for mapping in mappings:
+            ref = _first(mapping, "skillId", "skill_id")
+            skill = _find_ref("skills", ref, ["_id", "skill_id", "skillId"]) if ref is not None else None
+            if skill and str(skill.get("_id")) not in seen: skills.append(skill); seen.add(str(skill.get("_id")))
+        return jsonify({"skills": serialize_doc(skills), "skillIds": [str(s["_id"]) for s in skills]}), 200
+    data = request.get_json(silent=True) or {}; ids = data.get("skillIds", [])
+    if not isinstance(ids, list): return jsonify({"error": "skillIds must be an array"}), 400
+    resolved, invalid, seen = [], [], set()
+    for value in ids:
+        skill = _find_ref("skills", value, ["_id", "skill_id", "skillId"]) if value is not None else None
+        if not skill: invalid.append(value); continue
+        key = str(skill["_id"])
+        if key not in seen: resolved.append(skill); seen.add(key)
+    if invalid: return jsonify({"error": "One or more skills were not found. No mappings were changed.", "invalidSkillIds": invalid}), 400
+    existing = list(coll.find(query, {"_id": 1})); ops = [DeleteOne({"_id": x["_id"]}) for x in existing]; now = now_utc()
+    ops += [InsertOne({"careerId": career["_id"], "skillId": s["_id"], "order": i, "is_active": True, "createdAt": now, "updatedAt": now}) for i, s in enumerate(resolved, 1)]
+    if ops: coll.bulk_write(ops, ordered=True)
+    _log_action("set_career_skills", {"careerId": str(career["_id"]), "skillCount": len(resolved)})
+    return jsonify({"success": True, "mapped": len(resolved), "skillIds": [str(s["_id"]) for s in resolved]}), 200
+
+
+@admin_bp.route("/mappings/skill-chapters/<skill_id>", methods=["GET", "PUT", "OPTIONS"])
+@admin_required
+def skill_chapter_mapping(skill_id):
+    if request.method == "OPTIONS": return _cors_response()
+    skill = _find_ref("skills", skill_id, ["_id", "skill_id", "skillId"])
+    if not skill: return jsonify({"error": "Skill not found"}), 404
+    coll = get_collection("skill_chapter_mapping"); refs = [x for x in (skill.get("_id"), skill.get("skill_id"), skill.get("skillId"), skill_id) if x is not None]
+    query = _find_ref_many_query(refs, ["skillId", "skill_id"])
+    if request.method == "GET":
+        mappings = list(coll.find(query).sort([("order", 1), ("_id", 1)])); chapters = []; seen = set()
+        for m in mappings:
+            ref = _first(m, "chapterId", "chapter_id"); ch = _find_ref("chapters", ref, ["_id", "chapter_id", "chapterId"]) if ref is not None else None
+            if ch and str(ch["_id"]) not in seen: chapters.append(ch); seen.add(str(ch["_id"]))
+        direct_query = _find_ref_many_query(refs, ["skillId", "skill_id"])
+        for chapter in get_collection("chapters").find(direct_query):
+            if str(chapter["_id"]) not in seen:
+                chapters.append(chapter)
+                seen.add(str(chapter["_id"]))
+        return jsonify({"chapters": serialize_doc(chapters), "chapterIds": [str(c["_id"]) for c in chapters]}), 200
+    data = request.get_json(silent=True) or {}; ids = data.get("chapterIds", [])
+    if not isinstance(ids, list): return jsonify({"error": "chapterIds must be an array"}), 400
+    resolved, invalid, seen = [], [], set()
+    for value in ids:
+        ch = _find_ref("chapters", value, ["_id", "chapter_id", "chapterId"]) if value is not None else None
+        if not ch: invalid.append(value); continue
+        if str(ch["_id"]) not in seen: resolved.append(ch); seen.add(str(ch["_id"]))
+    if invalid: return jsonify({"error": "One or more chapters were not found. No mappings were changed.", "invalidChapterIds": invalid}), 400
+    old_mappings = list(coll.find(query))
+    old_chapters = []
+    requested_chapter_ids = {str(chapter["_id"]) for chapter in resolved}
+    for mapping in old_mappings:
+        chapter_ref = _first(mapping, "chapterId", "chapter_id")
+        chapter = _find_ref("chapters", chapter_ref, ["_id", "chapter_id", "chapterId"]) if chapter_ref is not None else None
+        if chapter:
+            old_chapters.append(chapter)
+        if chapter and str(chapter["_id"]) not in requested_chapter_ids:
+            coll.delete_one({"_id": mapping["_id"]})
+    direct_query = _find_ref_many_query(refs, ["skillId", "skill_id"])
+    old_chapter_ids = {str(item["_id"]) for item in old_chapters}
+    for chapter in get_collection("chapters").find(direct_query):
+        if str(chapter["_id"]) not in old_chapter_ids:
+            old_chapters.append(chapter)
+            old_chapter_ids.add(str(chapter["_id"]))
+    now = now_utc()
+    for index, chapter in enumerate(resolved, start=1):
+        chapter_refs = [
+            value for value in (chapter.get("_id"), chapter.get("chapter_id"), chapter.get("chapterId"))
+            if value is not None
         ]
-
-        update = {
-            key: data[key]
-            for key in allowed
-            if key in data
+        chapter_query = _find_ref_many_query(chapter_refs, ["chapterId", "chapter_id"])
+        chapter_mappings = list(coll.find(chapter_query))
+        mapping_fields = {
+            "skillId": skill["_id"],
+            "chapterId": chapter["_id"],
+            "skill_id": skill.get("skill_id", skill["_id"]),
+            "chapter_id": chapter.get("chapter_id", chapter["_id"]),
+            "order": index,
+            "updatedAt": now,
         }
-
-        if not update:
-            return jsonify({
-                "error": "No valid fields to update"
-            }), 400
-
-        update["updatedAt"] = now_utc()
-
+        if chapter_mappings:
+            for mapping in chapter_mappings:
+                coll.update_one({"_id": mapping["_id"]}, {"$set": mapping_fields})
+        else:
+            mapping_fields["createdAt"] = now
+            coll.insert_one(mapping_fields)
+    desired_ids = {str(chapter["_id"]) for chapter in resolved}
+    for chapter in {str(ch["_id"]): ch for ch in old_chapters}.values():
+        direct_skill_refs = [
+            str(chapter[field])
+            for field in ("skillId", "skill_id", "skillID")
+            if chapter.get(field) is not None
+        ]
+        selected_skill_refs = {
+            str(value)
+            for value in (skill.get("_id"), skill.get("skill_id"), skill.get("skillId"))
+            if value is not None
+        }
+        if str(chapter["_id"]) not in desired_ids and (
+            not direct_skill_refs or any(ref in selected_skill_refs for ref in direct_skill_refs)
+        ):
+            get_collection("chapters").update_one(
+                {"_id": chapter["_id"]},
+                {"$set": {"skillId": None, "skill_id": None, "skillName": "", "updatedAt": now}},
+            )
+    for index, chapter in enumerate(resolved, start=1):
         get_collection("chapters").update_one(
             {"_id": chapter["_id"]},
-            {"$set": update}
+            {"$set": {
+                "skillId": skill["_id"],
+                "skill_id": skill.get("skill_id", skill["_id"]),
+                "skillName": _name(skill, "skill"),
+                "chapter_order": _first(chapter, "chapter_order", "order", default=index),
+                "order": _first(chapter, "chapter_order", "order", default=index),
+                "updatedAt": now,
+            }},
         )
+    _log_action("set_skill_chapters", {"skillId": str(skill["_id"]), "chapterCount": len(resolved)})
+    return jsonify({"mapped": len(resolved), "chapterIds": [str(c["_id"]) for c in resolved]}), 200
 
-        _log_action(
-            "update_chapter",
-            {"chapterId": str(chapter["_id"])}
+
+@admin_bp.route("/careers/<career_id>/overview", methods=["GET", "OPTIONS"])
+@admin_required
+def career_overview(career_id):
+    if request.method == "OPTIONS": return _cors_response()
+    career = _find_ref("careers", career_id, ["_id", "career_id", "careerId"])
+    if not career: return jsonify({"error": "Career not found"}), 404
+    mappings = list(get_collection("career_skill_mapping").find(_find_ref_many_query([career.get("_id"), career.get("career_id"), career_id], ["careerId", "career_id"])).sort("order", 1))
+    skills = []
+    for m in mappings:
+        skill = _find_ref("skills", _first(m, "skillId", "skill_id"), ["_id", "skill_id", "skillId"])
+        if not skill: continue
+        cmaps = list(get_collection("skill_chapter_mapping").find(_find_ref_many_query([skill.get("_id"), skill.get("skill_id")], ["skillId", "skill_id"])).sort("order", 1))
+        chapters = []
+        for cm in cmaps:
+            ch = _find_ref("chapters", _first(cm, "chapterId", "chapter_id"), ["_id", "chapter_id", "chapterId"])
+            if ch: chapters.append(ch)
+        skills.append({"_id": skill.get("_id"), "skill_id": _first(skill, "skill_id", "skillId"), "name": _name(skill, "skill"), "category": _first(skill, "skill_category", "category", default=""), "description": skill.get("description", ""), "active": _active(skill), "chapters": serialize_doc(chapters)})
+    overview = {"_id": career.get("_id"), "career_id": _first(career, "career_id", "careerId"), "name": _name(career, "career"), "description": career.get("description", ""), "active": _active(career), "skills": skills, "summary": {"totalSkills": len(skills), "totalChapters": sum(len(s["chapters"]) for s in skills), "totalQuizzes": 0, "totalQuestions": get_collection("questions").count_documents({})}}
+    return jsonify({"career": serialize_doc(overview)}), 200
+
+
+# ------------------------- assessment question bank ----------------------
+def _normalize_level(value):
+    if value is None:
+        return None
+    normalized = str(value).strip().lower()
+    aliases = {
+        "beginner": "Beginner", "basic": "Beginner",
+        "intermediate": "Intermediate", "medium": "Intermediate",
+        "advanced": "Advanced", "expert": "Advanced",
+    }
+    return aliases.get(normalized)
+
+
+def _question_skill(skill_id):
+    return _find_ref("skills", skill_id, ["_id", "skill_id", "skillId"])
+
+
+def _question_chapter(chapter_id):
+    if chapter_id is None or str(chapter_id).strip() == "":
+        return None
+    return _find_ref("chapters", chapter_id, ["_id", "chapter_id", "chapterId"])
+
+
+def _chapter_belongs_to_skill(chapter, skill):
+    """Support both direct chapter.skill_id references and legacy mapping rows."""
+    direct_refs = [chapter.get(k) for k in ("skillId", "skill_id", "skillID") if chapter.get(k) is not None]
+    if direct_refs:
+        return any(
+            str(ref) in {str(x) for x in (skill.get("_id"), skill.get("skill_id"), skill.get("skillId")) if x is not None}
+            or any(isinstance(ref, ObjectId) and ref == skill.get("_id") for _ in [0])
+            for ref in direct_refs
         )
+    chapter_refs = [x for x in (chapter.get("_id"), chapter.get("chapter_id"), chapter.get("chapterId")) if x is not None]
+    skill_refs = [x for x in (skill.get("_id"), skill.get("skill_id"), skill.get("skillId")) if x is not None]
+    mapping = get_collection("skill_chapter_mapping")
+    for row in mapping.find({}):
+        chapter_ref = _first(row, "chapterId", "chapter_id")
+        skill_ref = _first(row, "skillId", "skill_id")
+        if any(str(chapter_ref) == str(x) for x in chapter_refs) and any(str(skill_ref) == str(x) for x in skill_refs):
+            return True
+    return False
 
-        return jsonify({"updated": True}), 200
 
-    get_collection("chapters").delete_one({
-        "_id": chapter["_id"]
+def _question_query(skill=None, level=None, chapter=None):
+    clauses = []
+    if skill:
+        skill_refs = [x for x in (skill.get("_id"), skill.get("skill_id"), skill.get("skillId")) if x is not None]
+        skill_clauses = []
+        for ref in skill_refs:
+            for candidate in _id_candidates(ref):
+                skill_clauses.extend([{"skillId": candidate}, {"skill_id": candidate}])
+        clauses.append({"$or": skill_clauses} if skill_clauses else {"_id": None})
+    if level:
+        level_values = [level, level.upper(), level.lower()]
+        clauses.append({"$or": [{field: {"$in": level_values}} for field in ("proficiencyLevel", "proficiency_level", "level", "category")]})
+    if chapter:
+        chapter_refs = [x for x in (chapter.get("_id"), chapter.get("chapter_id"), chapter.get("chapterId")) if x is not None]
+        chapter_clauses = []
+        for ref in chapter_refs:
+            for candidate in _id_candidates(ref):
+                chapter_clauses.extend([{"chapterId": candidate}, {"chapter_id": candidate}])
+        clauses.append({"$or": chapter_clauses} if chapter_clauses else {"_id": None})
+    if not clauses:
+        return {}
+    return clauses[0] if len(clauses) == 1 else {"$and": clauses}
+
+
+def _clean_question_payload(data, creating=True):
+    if not isinstance(data, dict):
+        return None, "A question object is required"
+    question_text = str(_first(data, "question", "text", "questionText", default="") or "").strip()
+    if not question_text:
+        return None, "Question text is required"
+    options = data.get("options", data.get("choices", []))
+    if not isinstance(options, list):
+        return None, "options must be an array"
+    options = [str(x.get("text", "") if isinstance(x, dict) else x).strip() for x in options]
+    if len(options) < 2 or any(not x for x in options):
+        return None, "Provide at least two non-empty answer options"
+    if len(options) > 6:
+        return None, "A maximum of six answer options is supported"
+    raw_correct = _first(data, "correctOption", "correct_option", "correctAnswer", "correct_answer", default=None)
+    correct = None
+    if isinstance(raw_correct, bool):
+        return None, "correctOption must be a valid zero-based option index"
+    if isinstance(raw_correct, int) or (isinstance(raw_correct, str) and raw_correct.strip().isdigit()):
+        candidate = int(raw_correct)
+        if 0 <= candidate < len(options):
+            correct = candidate
+    elif raw_correct is not None:
+        raw_text = str(raw_correct).strip()
+        for i, option in enumerate(options):
+            if option == raw_text:
+                correct = i
+                break
+    if correct is None:
+        return None, "correctOption must be a valid zero-based option index"
+    explanation = str(data.get("explanation") or "").strip()
+    active, active_error = _chapter_active(
+        _first(data, "isActive", "is_active", "active", default=True)
+    )
+    if active_error:
+        return None, active_error
+    doc = {
+        "question": question_text, "text": question_text,
+        "options": options, "correctOption": correct, "correctAnswer": correct,
+        "explanation": explanation, "isActive": active,
+        "is_active": active, "active": active, "updatedAt": now_utc(),
+    }
+    return doc, None
+
+
+def _question_level_for_chapter(chapter):
+    return _normalize_level(_first(chapter, "proficiencyLevel", "proficiency_level", "level"))
+
+
+def _question_coverage_summary(questions):
+    from routes.quiz import (
+        is_active as quiz_question_is_active,
+        question_identity,
+        valid_question_data,
+    )
+
+    active_questions = [
+        question for question in questions if quiz_question_is_active(question)
+    ]
+    identities = set()
+    valid_unique_count = 0
+    for question in active_questions:
+        if not valid_question_data(question):
+            continue
+        identity = question_identity(question)
+        if identity in identities:
+            continue
+        identities.add(identity)
+        valid_unique_count += 1
+
+    return {
+        "totalStoredQuestions": len(questions),
+        "activeQuestionCount": len(active_questions),
+        "validUniqueQuestionCount": valid_unique_count,
+    }
+
+
+@admin_bp.route("/question-bank", methods=["GET", "POST", "OPTIONS"])
+@admin_required
+def question_bank():
+    if request.method == "OPTIONS":
+        return _cors_response()
+    coll = get_collection("questions")
+    if request.method == "GET":
+        skill_id = (request.args.get("skillId") or request.args.get("skill_id") or "").strip()
+        chapter_id = (request.args.get("chapterId") or request.args.get("chapter_id") or "").strip()
+        level_raw = request.args.get("level") or request.args.get("proficiencyLevel") or request.args.get("proficiency_level")
+        q = (request.args.get("q") or "").strip()
+        page, limit = _pagination()
+        query_parts = []
+        skill = None
+        chapter = None
+        if skill_id:
+            skill = _question_skill(skill_id)
+            if not skill:
+                return jsonify({"error": "Skill not found"}), 404
+            query_parts.append(_question_query(skill=skill))
+        if chapter_id:
+            chapter = _question_chapter(chapter_id)
+            if not chapter:
+                return jsonify({"error": "Chapter not found"}), 404
+            if skill and not _chapter_belongs_to_skill(chapter, skill):
+                return jsonify({"error": "The selected chapter does not belong to the selected skill"}), 400
+            query_parts.append(_question_query(chapter=chapter))
+        if level_raw:
+            level = _normalize_level(level_raw)
+            if not level:
+                return jsonify({"error": "Invalid level", "allowedLevels": list(LEVELS)}), 400
+            query_parts.append(_question_query(level=level))
+        if q:
+            query_parts.append({"$or": [{k: {"$regex": _safe_regex(q), "$options": "i"}} for k in ("question", "text", "questionText")]})
+        query = query_parts[0] if len(query_parts) == 1 else ({"$and": query_parts} if query_parts else {})
+        total = coll.count_documents(query)
+        docs = list(coll.find(query).sort([("createdAt", -1), ("_id", 1)]).skip((page - 1) * limit).limit(limit))
+        return jsonify({"questions": serialize_doc(docs), "total": total, "page": page, "limit": limit, "totalPages": _pages(total, limit), "levels": list(LEVELS)}), 200
+
+    data = request.get_json(silent=True) or {}
+    skill_id = data.get("skillId", data.get("skill_id"))
+    chapter_id = data.get("chapterId", data.get("chapter_id"))
+    skill = _question_skill(skill_id) if skill_id is not None else None
+    if not skill:
+        return jsonify({"error": "A valid skillId is required"}), 400
+    chapter = _question_chapter(chapter_id)
+    if not chapter:
+        return jsonify({"error": "A valid chapterId is required. Questions must be assigned to a chapter."}), 400
+    if not _chapter_belongs_to_skill(chapter, skill):
+        return jsonify({"error": "The selected chapter does not belong to the selected skill"}), 400
+    chapter_level = _question_level_for_chapter(chapter)
+    if not chapter_level:
+        return jsonify({"error": "The selected chapter has no valid proficiency level. Update the chapter first."}), 400
+    requested_level = _normalize_level(data.get("proficiencyLevel", data.get("proficiency_level", data.get("level"))))
+    if requested_level and requested_level != chapter_level:
+        return jsonify({"error": "Question proficiency level must match its chapter", "chapterLevel": chapter_level}), 400
+    cleaned, error = _clean_question_payload(data)
+    if error:
+        return jsonify({"error": error}), 400
+    cleaned.update({
+        "skillId": skill["_id"], "skill_id": skill.get("skill_id", skill["_id"]),
+        "skillName": _name(skill, "skill"),
+        "chapterId": chapter["_id"], "chapter_id": chapter.get("chapter_id", chapter["_id"]),
+        "chapterName": _name(chapter, "chapter"),
+        "proficiencyLevel": chapter_level, "proficiency_level": chapter_level,
+        "level": chapter_level, "createdAt": now_utc(),
+        "createdBy": getattr(g, "current_user_id", None),
     })
+    normalized_question = " ".join(cleaned["question"].split()).casefold()
+    existing_questions = coll.find({
+        "$and": [
+            _question_query(skill=skill, chapter=chapter),
+            {"$or": [{"question": {"$exists": True}}, {"text": {"$exists": True}}, {"questionText": {"$exists": True}}]},
+        ]
+    })
+    for existing in existing_questions:
+        existing_text = str(_first(existing, "question", "text", "questionText", default="") or "")
+        if " ".join(existing_text.split()).casefold() == normalized_question:
+            return jsonify({"error": "An identical question already exists for this chapter"}), 409
+    result = coll.insert_one(cleaned)
+    cleaned["_id"] = result.inserted_id
+    _log_action("create_assessment_question", {"questionId": str(result.inserted_id), "skillId": str(skill["_id"]), "chapterId": str(chapter["_id"]), "level": chapter_level})
+    return jsonify({"success": True, "question": serialize_doc(cleaned)}), 201
 
-    mappings = list(
-        get_collection("skill_chapter_mapping").find({})
+
+@admin_bp.route("/question-bank/summary/<skill_id>", methods=["GET", "OPTIONS"])
+@admin_required
+def question_bank_summary(skill_id):
+    if request.method == "OPTIONS":
+        return _cors_response()
+    skill = _question_skill(skill_id)
+    if not skill:
+        return jsonify({"error": "Skill not found"}), 404
+    from routes.quiz import (
+        LEVELS as ASSESSMENT_LEVELS,
+        initial_assessment_targets,
+        post_learning_question_target,
     )
 
-    for mapping in mappings:
-        if (
-            _mapping_reference_matches(
-                mapping,
-                "chapterId",
-                chapter.get("_id")
-            )
-            or _mapping_reference_matches(
-                mapping,
-                "chapterId",
-                chapter.get("chapter_id")
-            )
-        ):
-            get_collection("skill_chapter_mapping").delete_one({
-                "_id": mapping["_id"]
-            })
+    coll = get_collection("questions")
+    skill_query = _question_query(skill=skill)
+    counts = {}
+    level_coverage = {}
+    for level in ASSESSMENT_LEVELS:
+        level_query = {"$and": [skill_query, _question_query(level=level)]}
+        level_questions = list(coll.find(level_query))
+        coverage = _question_coverage_summary(level_questions)
+        counts[level] = coverage["validUniqueQuestionCount"]
+        level_coverage[level] = {
+            **coverage,
+            "initialQuestionTarget": 0,
+            "postLearningQuestionTarget": post_learning_question_target(counts[level]),
+        }
+    initial_plan = initial_assessment_targets(counts)
+    for level in ASSESSMENT_LEVELS:
+        level_coverage[level]["initialQuestionTarget"] = initial_plan["levelTargets"].get(level, 0)
+        level_coverage[level]["assessmentReady"] = (
+            level_coverage[level]["initialQuestionTarget"] > 0
+            or level_coverage[level]["postLearningQuestionTarget"] > 0
+        )
+    chapter_counts = []
+    chapters = list(get_collection("chapters").find({}))
+    chapters.sort(key=lambda ch: (_question_level_for_chapter(ch) or "", _first(ch, "chapter_order", "order", default=0) or 0, _name(ch, "chapter").lower()))
+    for chapter in chapters:
+        if not _chapter_belongs_to_skill(chapter, skill):
+            continue
+        level = _question_level_for_chapter(chapter)
+        chapter_query = {"$and": [skill_query, _question_query(chapter=chapter)]}
+        eligible_query = (
+            {"$and": [chapter_query, _question_query(level=level)]}
+            if level
+            else {"_id": None}
+        )
+        eligible_questions = list(coll.find(eligible_query)) if level else []
+        coverage = _question_coverage_summary(eligible_questions)
+        chapter_counts.append({
+            "chapterId": str(chapter.get("_id")),
+            "chapter_id": _first(chapter, "chapter_id", "chapterId", default=str(chapter.get("_id"))),
+            "chapterName": _name(chapter, "chapter"),
+            "proficiencyLevel": level,
+            "questionCount": coverage["validUniqueQuestionCount"],
+            **coverage,
+        })
+    return jsonify({
+        "skillId": str(skill.get("skill_id", skill["_id"])),
+        "skillName": _name(skill, "skill"),
+        "counts": counts,
+        "levelCoverage": level_coverage,
+        "initialAssessmentTotalTarget": initial_plan["totalTarget"],
+        "chapters": chapter_counts,
+        "total": sum(counts.values()),
+    }), 200
 
-    quizzes = list(
-        get_collection("quizzes").find({})
-    )
 
-    for quiz in quizzes:
-        if (
-            _mapping_reference_matches(
-                quiz,
-                "chapterId",
-                chapter.get("_id")
-            )
-            or _mapping_reference_matches(
-                quiz,
-                "chapterId",
-                chapter.get("chapter_id")
-            )
-        ):
-            get_collection("quizzes").delete_one({
-                "_id": quiz["_id"]
-            })
+@admin_bp.route("/question-bank/<question_id>", methods=["GET", "PUT", "DELETE", "OPTIONS"])
+@admin_required
+def question_by_id(question_id):
+    if request.method == "OPTIONS":
+        return _cors_response()
+    coll = get_collection("questions")
+    doc = _find_ref("questions", question_id, ["_id", "questionId", "question_id"])
+    if not doc:
+        return jsonify({"error": "Question not found"}), 404
+    if request.method == "GET":
+        return jsonify({"question": serialize_doc(doc)}), 200
+    if request.method == "PUT":
+        data = request.get_json(silent=True) or {}
+        update = {}
+        content_fields = ("question", "text", "questionText", "options", "choices", "correctOption", "correct_option", "correctAnswer", "correct_answer", "explanation", "active", "isActive", "is_active")
+        if any(key in data for key in content_fields):
+            cleaned, error = _clean_question_payload({**doc, **data})
+            if error:
+                return jsonify({"error": error}), 400
+            update.update(cleaned)
 
-    _log_action(
-        "delete_chapter",
-        {"chapterId": chapter_id}
-    )
-
+        requested_skill_id = data.get("skillId", data.get("skill_id", doc.get("skillId", doc.get("skill_id"))))
+        requested_chapter_id = data.get("chapterId", data.get("chapter_id", doc.get("chapterId", doc.get("chapter_id"))))
+        skill = _question_skill(requested_skill_id) if requested_skill_id is not None else None
+        chapter = _question_chapter(requested_chapter_id) if requested_chapter_id is not None else None
+        if not skill:
+            return jsonify({"error": "A valid skillId is required"}), 400
+        if not chapter:
+            return jsonify({"error": "A valid chapterId is required"}), 400
+        if not _chapter_belongs_to_skill(chapter, skill):
+            return jsonify({"error": "The selected chapter does not belong to the selected skill"}), 400
+        chapter_level = _question_level_for_chapter(chapter)
+        if not chapter_level:
+            return jsonify({"error": "The selected chapter has no valid proficiency level"}), 400
+        requested_level_raw = data.get("proficiencyLevel", data.get("proficiency_level", data.get("level")))
+        if requested_level_raw is not None:
+            requested_level = _normalize_level(requested_level_raw)
+            if not requested_level:
+                return jsonify({"error": "Invalid level", "allowedLevels": list(LEVELS)}), 400
+            if requested_level != chapter_level:
+                return jsonify({"error": "Question proficiency level must match its chapter", "chapterLevel": chapter_level}), 400
+        update.update({
+            "skillId": skill["_id"], "skill_id": skill.get("skill_id", skill["_id"]),
+            "skillName": _name(skill, "skill"),
+            "chapterId": chapter["_id"], "chapter_id": chapter.get("chapter_id", chapter["_id"]),
+            "chapterName": _name(chapter, "chapter"),
+            "proficiencyLevel": chapter_level, "proficiency_level": chapter_level,
+            "level": chapter_level, "updatedAt": now_utc(),
+        })
+        coll.update_one({"_id": doc["_id"]}, {"$set": update})
+        updated = coll.find_one({"_id": doc["_id"]})
+        _log_action("update_assessment_question", {"questionId": str(doc["_id"]), "fields": list(update)})
+        return jsonify({"success": True, "question": serialize_doc(updated)}), 200
+    coll.delete_one({"_id": doc["_id"]})
+    _log_action("delete_assessment_question", {"questionId": question_id})
     return jsonify({"deleted": True}), 200
 
 
-# ============================================================
-# CHAPTER QUIZ
-# ============================================================
-
-@admin_bp.route(
-    "/chapters/<chapter_id>/quiz",
-    methods=["GET", "PUT", "OPTIONS"]
-)
-@admin_required
-def handle_chapter_quiz(chapter_id):
-    if request.method == "OPTIONS":
-        return _cors_response()
-
-    chapter = _find_by_reference(
-        "chapters",
-        chapter_id,
-        ["_id", "chapter_id", "chapterId"]
-    )
-
-    if chapter is None:
-        return jsonify({
-            "error": "Chapter not found"
-        }), 404
-
-    quizzes = get_collection("quizzes")
-
-    chapter_ref_values = [
-        chapter.get("_id"),
-        chapter.get("chapter_id"),
-        chapter.get("chapterId"),
-    ]
-
-    chapter_ref_values = [
-        value for value in chapter_ref_values
-        if value is not None and value != ""
-    ]
-
-    quiz_clauses = []
-
-    for value in chapter_ref_values:
-        for candidate in _id_candidates(value):
-            quiz_clauses.append({"chapterId": candidate})
-
-    quiz_query = (
-        {"$or": quiz_clauses}
-        if quiz_clauses
-        else {"chapterId": None}
-    )
-
-    if request.method == "GET":
-        quiz = quizzes.find_one(quiz_query)
-
-        if quiz is None:
-            return jsonify({
-                "quiz": {
-                    "chapterId": str(
-                        chapter.get("_id", chapter_id)
-                    ),
-                    "title": "",
-                    "questions": [],
-                    "passScore": 70,
-                    "requiredWatchPercentage": 98,
-                    "active": True
-                }
-            }), 200
-
-        return jsonify({
-            "quiz": serialize_doc(quiz)
-        }), 200
-
-    data = request.get_json(silent=True) or {}
-
-    title = (data.get("title") or "").strip()
-    questions = data.get("questions", [])
-
-    if not isinstance(questions, list):
-        return jsonify({
-            "error": "questions must be an array"
-        }), 400
-
-    try:
-        pass_score = int(data.get("passScore", 70))
-    except (TypeError, ValueError):
-        return jsonify({
-            "error": "passScore must be a number"
-        }), 400
-
-    try:
-        required_watch_percentage = int(
-            data.get("requiredWatchPercentage", 98)
-        )
-    except (TypeError, ValueError):
-        return jsonify({
-            "error": "requiredWatchPercentage must be a number"
-        }), 400
-
-    pass_score = max(70, min(pass_score, 100))
-    required_watch_percentage = max(
-        98,
-        min(required_watch_percentage, 100)
-    )
-
-    cleaned_questions = []
-
-    for question in questions:
-        if not isinstance(question, dict):
-            continue
-
-        question_text = (
-            question.get("question")
-            or question.get("text")
-            or ""
-        ).strip()
-
-        options = question.get("options", [])
-
-        if not isinstance(options, list):
-            options = []
-
-        # Preserve the four-option editor contract.
-        options = [str(option).strip() for option in options[:4]]
-
-        while len(options) < 4:
-            options.append("")
-
-        try:
-            correct_option = int(
-                question.get("correctOption", 0)
-            )
-        except (TypeError, ValueError):
-            correct_option = 0
-
-        correct_option = max(
-            0,
-            min(correct_option, 3)
-        )
-
-        explanation = (
-            question.get("explanation") or ""
-        ).strip()
-
-        if not question_text:
-            continue
-
-        cleaned_questions.append({
-            "question": question_text,
-            "options": options,
-            "correctOption": correct_option,
-            "explanation": explanation,
-        })
-
-    # IMPORTANT:
-    # Store chapterId in the same canonical form as the chapter _id.
-    # This makes the normal user/admin lookup deterministic.
-    canonical_chapter_id = chapter.get("_id")
-
-    quiz_doc = {
-        "chapterId": canonical_chapter_id,
-        "chapterBusinessId": (
-            chapter.get("chapter_id")
-            or chapter.get("chapterId")
-        ),
-        "title": title,
-        "questions": cleaned_questions,
-        "passScore": pass_score,
-        "requiredWatchPercentage": required_watch_percentage,
-        "active": bool(data.get("active", True)),
-        "updatedAt": now_utc(),
-    }
-
-    existing = quizzes.find_one({
-        "chapterId": canonical_chapter_id
-    })
-
-    # If the existing quiz was saved using a business ID, find it too.
-    if existing is None:
-        existing = quizzes.find_one(quiz_query)
-
-    if existing:
-        quizzes.update_one(
-            {"_id": existing["_id"]},
-            {"$set": quiz_doc}
-        )
-        quiz_doc["_id"] = existing["_id"]
-    else:
-        quiz_doc["createdAt"] = now_utc()
-        result = quizzes.insert_one(quiz_doc)
-        quiz_doc["_id"] = result.inserted_id
-
-    _log_action(
-        "update_chapter_quiz",
-        {
-            "chapterId": str(canonical_chapter_id),
-            "questionCount": len(cleaned_questions),
-            "passScore": pass_score,
-            "requiredWatchPercentage": required_watch_percentage,
-        }
-    )
-
-    return jsonify({
-        "success": True,
-        "message": "Quiz saved successfully",
-        "quiz": serialize_doc(quiz_doc)
-    }), 200
-
-# ============================================================
-# CAREER <-> SKILLS MAPPING
-# ============================================================
-
-@admin_bp.route(
-    "/mappings/career-skills/<career_id>",
-    methods=["GET", "PUT", "OPTIONS"]
-)
-@admin_required
-def handle_career_skills_mapping(career_id):
-    """
-    Manage Career <-> Skill mappings.
-
-    GET:
-        Returns skills explicitly assigned to a career.
-
-    PUT:
-        Replaces the selected career's skill mappings with
-        validated skill IDs.
-
-    Rules:
-        - MongoDB ObjectIds and supported business IDs are accepted.
-        - Every skill must exist before any mapping is changed.
-        - Skill names alone never establish a mapping.
-        - Skills are assigned only through explicit career mappings.
-        - Duplicate skill mappings are prevented.
-        - Existing mappings remain unchanged if validation fails.
-    """
-
-    from bson import ObjectId
-    from pymongo import DeleteOne, InsertOne
-    from datetime import datetime, timezone
-
-    # --------------------------------------------------------
-    # OPTIONS / CORS
-    # --------------------------------------------------------
-    if request.method == "OPTIONS":
-        return _cors_response()
-
-    careers_collection = get_collection("careers")
-    skills_collection = get_collection("skills")
-    mappings_collection = get_collection("career_skill_mapping")
-
-    requested_career_id = str(career_id).strip()
-
-    if not requested_career_id:
-        return jsonify({
-            "error": "Career ID is required"
-        }), 400
-
-    # --------------------------------------------------------
-    # HELPER: RESOLVE A DOCUMENT BY ITS SUPPORTED IDENTIFIERS
-    # --------------------------------------------------------
-    def resolve_document(collection, value, identifier_fields):
-        """
-        Resolve a document by MongoDB ObjectId, string _id,
-        or a supported business identifier.
-
-        A field containing None is not treated as an identifier.
-        """
-        if value is None:
-            return None
-
-        normalized_value = str(value).strip()
-
-        if not normalized_value:
-            return None
-
-        clauses = []
-
-        # MongoDB ObjectId lookup.
-        if ObjectId.is_valid(normalized_value):
-            clauses.append({
-                "_id": ObjectId(normalized_value)
-            })
-
-        # Legacy string _id and business identifier lookups.
-        for field in identifier_fields:
-            clauses.append({
-                field: normalized_value
-            })
-
-        if not clauses:
-            return None
-
-        query = clauses[0] if len(clauses) == 1 else {
-            "$or": clauses
-        }
-
-        return collection.find_one(query)
-
-    # --------------------------------------------------------
-    # RESOLVE THE CAREER
-    # --------------------------------------------------------
-    career = resolve_document(
-        careers_collection,
-        requested_career_id,
-        ["career_id", "careerId"]
-    )
-
-    if career is None:
-        return jsonify({
-            "error": "Career not found",
-            "requestedCareerId": requested_career_id
-        }), 404
-
-    canonical_career_id = career.get("_id")
-
-    if canonical_career_id is None:
-        return jsonify({
-            "error": "The career does not have a valid MongoDB _id"
-        }), 500
-
-    # --------------------------------------------------------
-    # BUILD THE CAREER MAPPING QUERY
-    # --------------------------------------------------------
-    #
-    # Existing mapping documents may store careerId as either
-    # a MongoDB ObjectId or a string.
-    #
-    # Include the canonical ID and existing business IDs.
-    # Do not match skills by name.
-    # --------------------------------------------------------
-    career_reference_values = [
-        canonical_career_id,
-        career.get("career_id"),
-        career.get("careerId"),
-        requested_career_id
-    ]
-
-    career_mapping_clauses = []
-    seen_career_references = set()
-
-    for value in career_reference_values:
-        if value is None:
-            continue
-
-        normalized_value = str(value).strip()
-
-        if not normalized_value:
-            continue
-
-        candidates = [normalized_value]
-
-        if ObjectId.is_valid(normalized_value):
-            candidates.append(ObjectId(normalized_value))
-
-        for candidate in candidates:
-            candidate_key = (
-                type(candidate).__name__,
-                str(candidate)
-            )
-
-            if candidate_key in seen_career_references:
-                continue
-
-            seen_career_references.add(candidate_key)
-
-            career_mapping_clauses.append({
-                "careerId": candidate
-            })
-
-    career_mapping_query = (
-        {"$or": career_mapping_clauses}
-        if career_mapping_clauses
-        else {"_id": None}
-    )
-
-    # --------------------------------------------------------
-    # GET: FETCH SKILLS EXPLICITLY MAPPED TO THIS CAREER
-    # --------------------------------------------------------
-    if request.method == "GET":
-
-        mappings = list(
-            mappings_collection.find(
-                career_mapping_query
-            ).sort([
-                ("order", 1),
-                ("_id", 1)
-            ])
-        )
-
-        ordered_skills = []
-        seen_skill_document_ids = set()
-
-        for mapping in mappings:
-            skill_reference = (
-                mapping.get("skillId")
-                if mapping.get("skillId") is not None
-                else mapping.get("skill_id")
-            )
-
-            if skill_reference is None:
-                continue
-
-            skill = resolve_document(
-                skills_collection,
-                skill_reference,
-                ["skill_id", "skillId"]
-            )
-
-            if skill is None:
-                # Ignore dangling legacy references in GET.
-                # They are not treated as valid skills.
-                continue
-
-            skill_document_id = skill.get("_id")
-
-            if skill_document_id is None:
-                continue
-
-            normalized_skill_id = str(skill_document_id)
-
-            if normalized_skill_id in seen_skill_document_ids:
-                continue
-
-            seen_skill_document_ids.add(normalized_skill_id)
-            ordered_skills.append(skill)
-
-        serialized_skills = serialize_doc(ordered_skills)
-
-        return jsonify({
-            "skills": serialized_skills,
-            "skillIds": [
-                str(skill["_id"])
-                for skill in ordered_skills
-                if skill.get("_id") is not None
-            ]
-        }), 200
-
-    # --------------------------------------------------------
-    # PUT: VALIDATE THE REQUEST BODY
-    # --------------------------------------------------------
-    data = request.get_json(silent=True)
-
-    if not isinstance(data, dict):
-        return jsonify({
-            "error": "A valid JSON request body is required"
-        }), 400
-
-    skill_ids = data.get("skillIds", [])
-
-    if not isinstance(skill_ids, list):
-        return jsonify({
-            "error": "skillIds must be an array"
-        }), 400
-
-    # --------------------------------------------------------
-    # RESOLVE AND VALIDATE ALL SKILLS
-    # --------------------------------------------------------
-    #
-    # Validate every ID before changing any mapping.
-    # A skill's name does not make it valid for a career;
-    # the mapping is an explicit administrative assignment.
-    # --------------------------------------------------------
-    resolved_skills = []
-    seen_resolved_skill_ids = set()
-    invalid_skill_ids = []
-
-    for requested_skill_id in skill_ids:
-
-        if requested_skill_id is None:
-            invalid_skill_ids.append(requested_skill_id)
-            continue
-
-        normalized_skill_id = str(requested_skill_id).strip()
-
-        if not normalized_skill_id:
-            invalid_skill_ids.append(requested_skill_id)
-            continue
-
-        skill = resolve_document(
-            skills_collection,
-            normalized_skill_id,
-            ["skill_id", "skillId"]
-        )
-
-        if skill is None:
-            invalid_skill_ids.append(normalized_skill_id)
-            continue
-
-        skill_document_id = skill.get("_id")
-
-        if skill_document_id is None:
-            invalid_skill_ids.append(normalized_skill_id)
-            continue
-
-        unique_key = str(skill_document_id)
-
-        if unique_key in seen_resolved_skill_ids:
-            continue
-
-        seen_resolved_skill_ids.add(unique_key)
-        resolved_skills.append(skill)
-
-    # --------------------------------------------------------
-    # REJECT INVALID REQUESTS WITHOUT CHANGING DATA
-    # --------------------------------------------------------
-    if invalid_skill_ids:
-        return jsonify({
-            "error": (
-                "One or more skills could not be found. "
-                "No mappings were changed."
-            ),
-            "invalidSkillIds": invalid_skill_ids
-        }), 400
-
-    # --------------------------------------------------------
-    # PREPARE THE REPLACEMENT MAPPINGS
-    # --------------------------------------------------------
-    #
-    # All IDs have now been validated.
-    # Store canonical MongoDB ObjectIds for consistent references.
-    # --------------------------------------------------------
-    now = datetime.now(timezone.utc)
-
-    new_mappings = []
-
-    for order_index, skill in enumerate(resolved_skills, start=1):
-        new_mappings.append({
-            "careerId": canonical_career_id,
-            "skillId": skill["_id"],
-            "order": order_index,
-            "createdAt": now,
-            "updatedAt": now
-        })
-
-    # --------------------------------------------------------
-    # REPLACE MAPPINGS
-    # --------------------------------------------------------
-    #
-    # Use a MongoDB bulk write to perform the deletion and
-    # insertion operations together.
-    #
-    # Validation errors above never reach this section.
-    # --------------------------------------------------------
-    existing_mappings = list(
-        mappings_collection.find(
-            career_mapping_query,
-            {"_id": 1}
-        )
-    )
-
-    operations = []
-
-    for mapping in existing_mappings:
-        operations.append(
-            DeleteOne({
-                "_id": mapping["_id"]
-            })
-        )
-
-    for mapping in new_mappings:
-        operations.append(
-            InsertOne(mapping)
-        )
-
-    if operations:
-        mappings_collection.bulk_write(
-            operations,
-            ordered=True
-        )
-
-    # --------------------------------------------------------
-    # AUDIT LOG
-    # --------------------------------------------------------
-    _log_action(
-        "set_career_skills",
-        {
-            "careerId": str(canonical_career_id),
-            "skillCount": len(new_mappings),
-            "deletedMappingCount": len(existing_mappings)
-        }
-    )
-
-    # --------------------------------------------------------
-    # RESPONSE
-    # --------------------------------------------------------
-    return jsonify({
-        "success": True,
-        "message": "Career skills mapped successfully",
-        "careerId": str(canonical_career_id),
-        "mapped": len(new_mappings),
-        "skillIds": [
-            str(skill["_id"])
-            for skill in resolved_skills
-        ]
-    }), 200
-
-
-# ============================================================
-# SKILL ↔ CHAPTERS MAPPING
-# ============================================================
-
-@admin_bp.route(
-    "/mappings/skill-chapters/<skill_id>",
-    methods=["GET", "PUT", "OPTIONS"]
-)
-@admin_required
-def handle_skill_chapters_mapping(skill_id):
-    if request.method == "OPTIONS":
-        return _cors_response()
-
-    skill = _find_by_reference(
-        "skills",
-        skill_id,
-        ["_id", "skill_id", "skillId"]
-    )
-
-    if skill is None:
-        return jsonify({
-            "error": "Skill not found"
-        }), 404
-
-    mappings_collection = get_collection(
-        "skill_chapter_mapping"
-    )
-
-    skill_reference_values = [
-        skill.get("_id"),
-        skill.get("skill_id"),
-        skill.get("skillId"),
-        skill_id,
-    ]
-
-    skill_reference_values = [
-        value for value in skill_reference_values
-        if value is not None and value != ""
-    ]
-
-    if request.method == "GET":
-        clauses = []
-
-        for value in skill_reference_values:
-            for candidate in _id_candidates(value):
-                clauses.append({
-                    "skillId": candidate
-                })
-
-        mappings = list(
-            mappings_collection.find(
-                {"$or": clauses}
-            ).sort("order", 1)
-        ) if clauses else []
-
-        chapter_refs = _extract_ref_ids(
-            mappings,
-            ["chapterId", "chapter_id"]
-        )
-
-        chapters = _find_many_by_references(
-            "chapters",
-            chapter_refs,
-            ["_id", "chapter_id", "chapterId"]
-        )
-
-        chapter_lookup = {}
-
-        for chapter in chapters:
-            for key in [
-                chapter.get("_id"),
-                chapter.get("chapter_id"),
-                chapter.get("chapterId"),
-            ]:
-                if key is not None:
-                    chapter_lookup[str(key)] = chapter
-
-        ordered_chapters = []
-
-        for ref in chapter_refs:
-            chapter = None
-
-            for candidate in _id_candidates(ref):
-                chapter = chapter_lookup.get(str(candidate))
-                if chapter:
-                    break
-
-            if chapter:
-                ordered_chapters.append(chapter)
-
-        ordered_chapters.sort(
-            key=lambda item: (
-                item.get("order", 0),
-                item.get("createdAt", datetime.min)
-                if isinstance(
-                    item.get("createdAt"),
-                    datetime
-                )
-                else datetime.min
-            )
-        )
-
-        return jsonify({
-            "chapters": serialize_doc(ordered_chapters)
-        }), 200
-
-    data = request.get_json(silent=True) or {}
-    chapter_ids = data.get("chapterIds", [])
-
-    if not isinstance(chapter_ids, list):
-        return jsonify({
-            "error": "chapterIds must be an array"
-        }), 400
-
-    resolved_chapter_ids = []
-
-    for chapter_id in chapter_ids:
-        chapter = _find_by_reference(
-            "chapters",
-            chapter_id,
-            ["_id", "chapter_id", "chapterId"]
-        )
-
-        if chapter:
-            resolved_chapter_ids.append(chapter["_id"])
-
-    old_mappings = list(
-        mappings_collection.find({})
-    )
-
-    for mapping in old_mappings:
-        matches = False
-
-        for value in skill_reference_values:
-            if _mapping_reference_matches(
-                mapping,
-                "skillId",
-                value
-            ):
-                matches = True
-                break
-
-        if matches:
-            mappings_collection.delete_one({
-                "_id": mapping["_id"]
-            })
-
-    now = now_utc()
-
-    for order_index, chapter_obj_id in enumerate(resolved_chapter_ids, start=1):
-        mappings_collection.insert_one({
-            "skillId": skill["_id"],
-            "chapterId": chapter_obj_id,
-            "order": order_index,
-            "createdAt": now,
-        })
-
-    _log_action(
-        "set_skill_chapters",
-        {
-            "skillId": str(skill["_id"]),
-            "chapterCount": len(resolved_chapter_ids)
-        }
-    )
-
-    return jsonify({
-        "mapped": len(resolved_chapter_ids)
-    }), 200
-
-
-# ============================================================
-# CAREER FULL HIERARCHY / OVERVIEW
-# ============================================================
-
-@admin_bp.route(
-    "/careers/<career_id>/overview",
-    methods=["GET", "OPTIONS"]
-)
-@admin_required
-def get_career_overview(career_id):
-    if request.method == "OPTIONS":
-        return _cors_response()
-
-    career = _find_by_reference(
-        "careers",
-        career_id,
-        ["_id", "career_id", "careerId"]
-    )
-
-    if career is None:
-        return jsonify({
-            "error": "Career not found"
-        }), 404
-
-    career_skill_collection = get_collection(
-        "career_skill_mapping"
-    )
-    skill_chapter_collection = get_collection(
-        "skill_chapter_mapping"
-    )
-    skills_collection = get_collection("skills")
-    chapters_collection = get_collection("chapters")
-    quizzes_collection = get_collection("quizzes")
-
-    # --------------------------------------------------------
-    # CAREER → SKILLS
-    # --------------------------------------------------------
-
-    career_refs = [
-        career.get("_id"),
-        career.get("career_id"),
-        career.get("careerId"),
-        career_id,
-    ]
-
-    career_refs = [
-        value for value in career_refs
-        if value is not None and value != ""
-    ]
-
-    career_skill_clauses = []
-
-    for value in career_refs:
-        for candidate in _id_candidates(value):
-            career_skill_clauses.append({
-                "careerId": candidate
-            })
-
-    career_skill_mappings = list(
-        career_skill_collection.find(
-            {"$or": career_skill_clauses}
-        )
-    ) if career_skill_clauses else []
-
-    skill_refs = _extract_ref_ids(
-        career_skill_mappings,
-        ["skillId", "skill_id"]
-    )
-
-    skill_documents = _find_many_by_references(
-        "skills",
-        skill_refs,
-        ["_id", "skill_id", "skillId"]
-    )
-
-    skill_lookup = {}
-
-    for skill in skill_documents:
-        for key in [
-            skill.get("_id"),
-            skill.get("skill_id"),
-            skill.get("skillId"),
-        ]:
-            if key is not None:
-                skill_lookup[str(key)] = skill
-
-    skills = []
-
-    # --------------------------------------------------------
-    # PRESERVE CAREER → SKILL MAPPING ORDER
-    # --------------------------------------------------------
-
-    for skill_ref in skill_refs:
-        skill = None
-
-        for candidate in _id_candidates(skill_ref):
-            skill = skill_lookup.get(str(candidate))
-            if skill:
-                break
-
-        if not skill:
-            continue
-
-        # ----------------------------------------------------
-        # SKILL → CHAPTERS
-        # ----------------------------------------------------
-
-        skill_refs_for_mapping = [
-            skill.get("_id"),
-            skill.get("skill_id"),
-            skill.get("skillId"),
-        ]
-
-        skill_refs_for_mapping = [
-            value for value in skill_refs_for_mapping
-            if value is not None and value != ""
-        ]
-
-        skill_chapter_clauses = []
-
-        for value in skill_refs_for_mapping:
-            for candidate in _id_candidates(value):
-                skill_chapter_clauses.append({
-                    "skillId": candidate
-                })
-
-        chapter_mappings = list(
-            skill_chapter_collection.find(
-                {"$or": skill_chapter_clauses}
-            )
-        ) if skill_chapter_clauses else []
-
-        chapter_refs = _extract_ref_ids(
-            chapter_mappings,
-            ["chapterId", "chapter_id"]
-        )
-
-        chapter_documents = _find_many_by_references(
-            "chapters",
-            chapter_refs,
-            ["_id", "chapter_id", "chapterId"]
-        )
-
-        chapter_lookup = {}
-
-        for chapter in chapter_documents:
-            for key in [
-                chapter.get("_id"),
-                chapter.get("chapter_id"),
-                chapter.get("chapterId"),
-            ]:
-                if key is not None:
-                    chapter_lookup[str(key)] = chapter
-
-        chapters = []
-
-        for chapter_ref in chapter_refs:
-            chapter = None
-
-            for candidate in _id_candidates(chapter_ref):
-                chapter = chapter_lookup.get(str(candidate))
-                if chapter:
-                    break
-
-            if not chapter:
-                continue
-
-            # ------------------------------------------------
-            # CHAPTER → QUIZ
-            # ------------------------------------------------
-
-            quiz_refs = [
-                chapter.get("_id"),
-                chapter.get("chapter_id"),
-                chapter.get("chapterId"),
-            ]
-
-            quiz_clauses = []
-
-            for value in quiz_refs:
-                if value is None or value == "":
-                    continue
-
-                for candidate in _id_candidates(value):
-                    quiz_clauses.append({
-                        "chapterId": candidate
-                    })
-
-            quiz = (
-                quizzes_collection.find_one({
-                    "$or": quiz_clauses
-                })
-                if quiz_clauses
-                else None
-            )
-
-            chapter_data = {
-                "_id": chapter.get("_id"),
-                "chapter_id": (
-                    chapter.get("chapter_id")
-                    or chapter.get("chapterId")
-                ),
-                "title": chapter.get("title", ""),
-                "description": chapter.get("description", ""),
-                "youtubeUrl": chapter.get("youtubeUrl", ""),
-                "duration": chapter.get("duration", ""),
-                "order": chapter.get("order", 0),
-                "active": chapter.get("active", True),
-                "quiz": None,
-            }
-
-            if quiz:
-                chapter_data["quiz"] = {
-                    "_id": quiz.get("_id"),
-                    "chapterId": quiz.get("chapterId"),
-                    "title": quiz.get("title", ""),
-                    "questions": quiz.get("questions", []),
-                    "passScore": quiz.get("passScore", 70),
-                    "requiredWatchPercentage": quiz.get(
-                        "requiredWatchPercentage",
-                        98
-                    ),
-                    "active": quiz.get("active", True),
-                }
-
-            chapters.append(chapter_data)
-
-        # Always sort chapters by curriculum order.
-        chapters.sort(
-            key=lambda item: item.get("order", 0)
-        )
-
-        skills.append({
-            "_id": skill.get("_id"),
-            "skill_id": (
-                skill.get("skill_id")
-                or skill.get("skillId")
-            ),
-            "name": skill.get("name", ""),
-            "category": skill.get("category", ""),
-            "description": skill.get("description", ""),
-            "active": skill.get("active", True),
-            "chapters": chapters,
-        })
-
-    total_chapters = sum(
-        len(skill.get("chapters", []))
-        for skill in skills
-    )
-
-    total_quizzes = 0
-    total_questions = 0
-
-    for skill in skills:
-        for chapter in skill.get("chapters", []):
-            quiz = chapter.get("quiz")
-
-            if quiz:
-                total_quizzes += 1
-                total_questions += len(
-                    quiz.get("questions", [])
-                )
-
-    overview = {
-        "_id": career.get("_id"),
-        "career_id": (
-            career.get("career_id")
-            or career.get("careerId")
-        ),
-        "name": career.get("name", ""),
-        "description": career.get("description", ""),
-        "active": career.get("active", True),
-        "skills": skills,
-        "summary": {
-            "totalSkills": len(skills),
-            "totalChapters": total_chapters,
-            "totalQuizzes": total_quizzes,
-            "totalQuestions": total_questions,
-        },
-    }
-
-    return jsonify({
-        "career": serialize_doc(overview)
-    }), 200
-
-
-# ============================================================
-# RESUMES
-# ============================================================
-
+# ------------------------------- resumes --------------------------------
 @admin_bp.route("/resumes", methods=["GET", "OPTIONS"])
 @admin_required
 def list_resumes():
-    if request.method == "OPTIONS":
-        return _cors_response()
-
-    page, limit = _pagination()
-    resumes_collection = get_collection("resumes")
-
-    total = resumes_collection.count_documents({})
-
-    resumes = list(
-        resumes_collection.find({})
-        .sort("createdAt", -1)
-        .skip((page - 1) * limit)
-        .limit(limit)
-    )
-
-    return jsonify({
-        "resumes": serialize_doc(resumes),
-        "total": total,
-        "page": page,
-        "limit": limit,
-        "totalPages": _total_pages(total, limit),
-    }), 200
+    if request.method == "OPTIONS": return _cors_response()
+    page, limit = _pagination(); coll = get_collection("resumes"); total = coll.count_documents({})
+    docs = list(coll.find({}).sort("createdAt", -1).skip((page-1)*limit).limit(limit))
+    return jsonify({"resumes": serialize_doc(docs), "total": total, "page": page, "limit": limit, "totalPages": _pages(total, limit)}), 200
 
 
 @admin_bp.route("/resumes/<resume_id>", methods=["GET", "OPTIONS"])
 @admin_required
-def get_resume(resume_id):
-    if request.method == "OPTIONS":
-        return _cors_response()
-
-    resume_obj_id = _valid_object_id(resume_id)
-
-    if resume_obj_id is None:
-        return jsonify({"error": "Invalid resume ID"}), 400
-
-    resume = get_collection("resumes").find_one({
-        "_id": resume_obj_id
-    })
-
-    if resume is None:
-        return jsonify({"error": "Resume not found"}), 404
-
-    return jsonify(serialize_doc(resume)), 200
+def resume_by_id(resume_id):
+    if request.method == "OPTIONS": return _cors_response()
+    if not ObjectId.is_valid(resume_id): return jsonify({"error": "Invalid resume ID"}), 400
+    doc = get_collection("resumes").find_one({"_id": ObjectId(resume_id)})
+    if not doc: return jsonify({"error": "Resume not found"}), 404
+    return jsonify(serialize_doc(doc)), 200
 
 
-# ============================================================
-# FEEDBACK
-# ============================================================
-
+# -------------------------------- feedback -------------------------------
 @admin_bp.route("/feedback", methods=["GET", "OPTIONS"])
 @admin_required
 def list_feedback():
-    if request.method == "OPTIONS":
-        return _cors_response()
-
-    status = (
-        request.args.get("status") or ""
-    ).strip().lower()
-
-    page, limit = _pagination()
-    query = {}
-
-    if status:
-        query["status"] = status
-
-    feedback_collection = get_collection("feedback")
-
-    total = feedback_collection.count_documents(query)
-
-    feedback = list(
-        feedback_collection.find(query)
-        .sort("createdAt", -1)
-        .skip((page - 1) * limit)
-        .limit(limit)
-    )
-
-    return jsonify({
-        "feedback": serialize_doc(feedback),
-        "total": total,
-        "page": page,
-        "limit": limit,
-        "totalPages": _total_pages(total, limit),
-    }), 200
+    if request.method == "OPTIONS": return _cors_response()
+    status = (request.args.get("status") or "").strip().lower(); page, limit = _pagination(); query = {"status": status} if status else {}
+    coll = get_collection("feedback"); total = coll.count_documents(query); docs = list(coll.find(query).sort("createdAt", -1).skip((page-1)*limit).limit(limit))
+    return jsonify({"feedback": serialize_doc(docs), "total": total, "page": page, "limit": limit, "totalPages": _pages(total, limit)}), 200
 
 
-@admin_bp.route(
-    "/feedback/<feedback_id>",
-    methods=["PUT", "OPTIONS"]
-)
+def _reply_feedback(feedback_id, require_nonempty=True):
+    if not ObjectId.is_valid(feedback_id): return jsonify({"error": "Invalid feedback ID"}), 400
+    coll = get_collection("feedback"); doc = coll.find_one({"_id": ObjectId(feedback_id)})
+    if not doc: return jsonify({"error": "Feedback not found"}), 404
+    data = request.get_json(silent=True) or {}; reply = data.get("adminReply", data.get("reply", "")); reply = str(reply or "").strip()
+    if require_nonempty and not reply: return jsonify({"error": "Admin reply cannot be empty"}), 400
+    update = {"adminReply": reply, "status": "answered" if reply else data.get("status", doc.get("status", "pending")), "updatedAt": now_utc()}
+    if reply: update.update({"repliedAt": now_utc(), "repliedBy": getattr(g, "current_user_id", None)})
+    coll.update_one({"_id": doc["_id"]}, {"$set": update}); notified = False
+    if reply and doc.get("userId"):
+        notified = _create_notification(doc.get("userId"), "feedback_reply", "Feedback Response", "Your feedback has received a response from the admin.") is not None
+    _log_action("reply_to_feedback", {"feedbackId": feedback_id, "notificationCreated": notified})
+    return jsonify({"updated": True, "feedback": serialize_doc(coll.find_one({"_id": doc["_id"]})), "notificationCreated": notified}), 200
+
+
+@admin_bp.route("/feedback/<feedback_id>", methods=["PUT", "OPTIONS"])
 @admin_required
-def update_feedback_status(feedback_id):
-    if request.method == "OPTIONS":
-        return _cors_response()
-
-    feedback_obj_id = _valid_object_id(feedback_id)
-
-    if feedback_obj_id is None:
-        return jsonify({"error": "Invalid feedback ID"}), 400
-
-    feedback_collection = get_collection("feedback")
-
-    feedback = feedback_collection.find_one({
-        "_id": feedback_obj_id
-    })
-
-    if feedback is None:
-        return jsonify({"error": "Feedback not found"}), 404
-
+def update_feedback(feedback_id):
+    if request.method == "OPTIONS": return _cors_response()
     data = request.get_json(silent=True) or {}
-    update = {}
-
-    if "status" in data:
-        status = str(data.get("status")).strip().lower()
-
-        allowed_statuses = {
-            "pending",
-            "reviewed",
-            "answered",
-            "replied",
-            "resolved"
-        }
-
-        if status not in allowed_statuses:
-            return jsonify({
-                "error": "Invalid feedback status",
-                "allowedStatuses": sorted(allowed_statuses)
-            }), 400
-
-        if status == "replied":
-            status = "answered"
-
-        update["status"] = status
-
-    if "adminReply" in data:
-        reply = data.get("adminReply")
-
-        if reply is None:
-            reply = ""
-
-        reply = str(reply).strip()
-        update["adminReply"] = reply
-
-        if reply:
-            update["status"] = "answered"
-            update["repliedAt"] = now_utc()
-            update["repliedBy"] = getattr(
-                g,
-                "current_user_id",
-                None
-            )
-
-    if not update:
-        return jsonify({
-            "error": "Provide status or adminReply"
-        }), 400
-
-    update["updatedAt"] = now_utc()
-
-    feedback_collection.update_one(
-        {"_id": feedback_obj_id},
-        {"$set": update}
-    )
-
-    notification_created = False
-
-    if update.get("adminReply") and feedback.get("userId"):
-        notification = _create_notification(
-            user_id=feedback.get("userId"),
-            notification_type="feedback_reply",
-            title="Feedback Response",
-            message=(
-                "Your feedback has received a response "
-                "from the admin."
-            )
-        )
-        notification_created = notification is not None
-
-    _log_action(
-        "update_feedback",
-        {
-            "feedbackId": feedback_id,
-            "fields": list(update.keys()),
-            "notificationCreated": notification_created,
-        }
-    )
-
-    updated_feedback = feedback_collection.find_one({
-        "_id": feedback_obj_id
-    })
-
-    return jsonify({
-        "updated": True,
-        "feedback": serialize_doc(updated_feedback),
-        "notificationCreated": notification_created,
-    }), 200
+    if "adminReply" in data or "reply" in data: return _reply_feedback(feedback_id, require_nonempty=False)
+    if not ObjectId.is_valid(feedback_id): return jsonify({"error": "Invalid feedback ID"}), 400
+    coll = get_collection("feedback"); doc = coll.find_one({"_id": ObjectId(feedback_id)})
+    if not doc: return jsonify({"error": "Feedback not found"}), 404
+    status = str(data.get("status", "")).strip().lower()
+    allowed = {"pending", "reviewed", "answered", "resolved", "replied"}
+    if status not in allowed: return jsonify({"error": "Invalid feedback status", "allowedStatuses": sorted(allowed)}), 400
+    if status == "replied": status = "answered"
+    coll.update_one({"_id": doc["_id"]}, {"$set": {"status": status, "updatedAt": now_utc()}}); _log_action("update_feedback", {"feedbackId": feedback_id, "status": status})
+    return jsonify({"updated": True, "feedback": serialize_doc(coll.find_one({"_id": doc["_id"]}))}), 200
 
 
-@admin_bp.route(
-    "/feedback/<feedback_id>/reply",
-    methods=["PUT", "OPTIONS"]
-)
+@admin_bp.route("/feedback/<feedback_id>/reply", methods=["PUT", "OPTIONS"])
 @admin_required
-def reply_to_feedback(feedback_id):
-    if request.method == "OPTIONS":
-        return _cors_response()
+def reply_feedback(feedback_id):
+    if request.method == "OPTIONS": return _cors_response()
+    return _reply_feedback(feedback_id, require_nonempty=True)
 
-    feedback_obj_id = _valid_object_id(feedback_id)
 
-    if feedback_obj_id is None:
-        return jsonify({"error": "Invalid feedback ID"}), 400
-
-    feedback_collection = get_collection("feedback")
-
-    feedback = feedback_collection.find_one({
-        "_id": feedback_obj_id
-    })
-
-    if feedback is None:
-        return jsonify({"error": "Feedback not found"}), 404
-
-    data = request.get_json(silent=True) or {}
-
-    reply = (
-        data.get("adminReply")
-        if "adminReply" in data
-        else data.get("reply")
-    )
-
-    if reply is None:
-        reply = ""
-
-    reply = str(reply).strip()
-
-    if not reply:
-        return jsonify({
-            "error": "Admin reply cannot be empty"
-        }), 400
-
-    admin_id = getattr(g, "current_user_id", None)
-    now = now_utc()
-
-    update = {
-        "adminReply": reply,
-        "status": "answered",
-        "repliedAt": now,
-        "repliedBy": admin_id,
-        "updatedAt": now,
-    }
-
-    feedback_collection.update_one(
-        {"_id": feedback_obj_id},
-        {"$set": update}
-    )
-
-    notification_created = False
-    user_id = feedback.get("userId")
-
-    if user_id:
-        notification = _create_notification(
-            user_id=user_id,
-            notification_type="feedback_reply",
-            title="Feedback Response",
-            message=(
-                "Your feedback has received a response "
-                "from the admin."
-            )
-        )
-        notification_created = notification is not None
-
-    _log_action(
-        "reply_to_feedback",
-        {
-            "feedbackId": feedback_id,
-            "notificationCreated": notification_created,
-        }
-    )
-
-    updated_feedback = feedback_collection.find_one({
-        "_id": feedback_obj_id
-    })
-
-    return jsonify({
-        "message": "Feedback reply sent successfully",
-        "feedback": serialize_doc(updated_feedback),
-        "notificationCreated": notification_created,
-    }), 200
-# ============================================================
-# EXPORT USERS
-# ============================================================
-
-@admin_bp.route(
-    "/export/users",
-    methods=["GET", "OPTIONS"]
-)
+# ------------------------------ exports/import --------------------------
+@admin_bp.route("/export/users", methods=["GET", "OPTIONS"])
 @admin_required
 def export_users():
-    if request.method == "OPTIONS":
-        return _cors_response()
-
-    workbook = Workbook()
-    worksheet = workbook.active
-    worksheet.title = "Users"
-
-    worksheet.append([
-        "ID",
-        "Name",
-        "Email",
-        "Age",
-        "Phone",
-        "Profession",
-        "Active Career",
-        "Streak",
-        "Joined"
-    ])
-
-    users = list(
-        get_collection("users")
-        .find({"role": {"$ne": "admin"}})
-        .sort("createdAt", -1)
-    )
-
-    careers_collection = get_collection("careers")
-
-    for user in users:
-        active_career_name = user.get(
-            "activeCareerName",
-            ""
-        ) or ""
-
-        if not active_career_name:
-            career_id = user.get("activeCareerId")
-
-            if career_id:
-                career = _find_by_reference(
-                    "careers",
-                    career_id,
-                    ["_id", "career_id", "careerId"]
-                )
-
-                if career:
-                    active_career_name = career.get(
-                        "name",
-                        ""
-                    )
-
-        created_at = user.get("createdAt")
-
-        if hasattr(created_at, "isoformat"):
-            created_at = created_at.isoformat()
-
-        worksheet.append([
-            str(user.get("_id", "")),
-            user.get("name", ""),
-            user.get("email", ""),
-            user.get("age", ""),
-            user.get("phone", ""),
-            user.get("profession", ""),
-            active_career_name,
-            user.get("streak", 0),
-            created_at or ""
-        ])
-
-    buffer = io.BytesIO()
-    workbook.save(buffer)
-    buffer.seek(0)
-
-    _log_action("export_users")
-
-    return send_file(
-        buffer,
-        mimetype=(
-            "application/vnd.openxmlformats-"
-            "officedocument.spreadsheetml.sheet"
-        ),
-        as_attachment=True,
-        download_name="users.xlsx"
-    )
+    if request.method == "OPTIONS": return _cors_response()
+    wb = Workbook(); ws = wb.active; ws.title = "Users"; ws.append(["ID", "Name", "Email", "Age", "Phone", "Profession", "Active Career", "Streak", "Joined"])
+    for user in get_collection("users").find({"role": {"$ne": "admin"}}).sort("createdAt", -1):
+        career = _find_ref("careers", user.get("activeCareerId"), ["_id", "career_id", "careerId"]) if user.get("activeCareerId") else None
+        created = user.get("createdAt"); ws.append([str(user.get("_id", "")), user.get("name", ""), user.get("email", ""), user.get("age", ""), user.get("phone", ""), user.get("profession", ""), _name(career, "career") if career else "", user.get("streak", 0), created.isoformat() if hasattr(created, "isoformat") else created or ""])
+    buffer = io.BytesIO(); wb.save(buffer); buffer.seek(0); _log_action("export_users")
+    return send_file(buffer, mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", as_attachment=True, download_name="users.xlsx")
 
 
-# ============================================================
-# EXPORT FEEDBACK
-# ============================================================
-
-@admin_bp.route(
-    "/export/feedback",
-    methods=["GET", "OPTIONS"]
-)
+@admin_bp.route("/export/feedback", methods=["GET", "OPTIONS"])
 @admin_required
 def export_feedback():
-    if request.method == "OPTIONS":
-        return _cors_response()
-
-    workbook = Workbook()
-    worksheet = workbook.active
-    worksheet.title = "Feedback"
-
-    worksheet.append([
-        "ID",
-        "Name",
-        "Email",
-        "Message",
-        "Status",
-        "Admin Reply",
-        "Created",
-        "Updated"
-    ])
-
-    feedback = list(
-        get_collection("feedback")
-        .find({})
-        .sort("createdAt", -1)
-    )
-
-    for item in feedback:
-        created_at = item.get("createdAt")
-        updated_at = item.get("updatedAt")
-
-        if hasattr(created_at, "isoformat"):
-            created_at = created_at.isoformat()
-
-        if hasattr(updated_at, "isoformat"):
-            updated_at = updated_at.isoformat()
-
-        worksheet.append([
-            str(item.get("_id", "")),
-            item.get("name", ""),
-            item.get("email", ""),
-            item.get("message", ""),
-            item.get("status", ""),
-            item.get("adminReply", ""),
-            created_at or "",
-            updated_at or ""
-        ])
-
-    buffer = io.BytesIO()
-    workbook.save(buffer)
-    buffer.seek(0)
-
-    _log_action("export_feedback")
-
-    return send_file(
-        buffer,
-        mimetype=(
-            "application/vnd.openxmlformats-"
-            "officedocument.spreadsheetml.sheet"
-        ),
-        as_attachment=True,
-        download_name="feedback.xlsx"
-    )
+    if request.method == "OPTIONS": return _cors_response()
+    wb = Workbook(); ws = wb.active; ws.title = "Feedback"; ws.append(["ID", "Name", "Email", "Message", "Status", "Admin Reply", "Created", "Updated"])
+    for item in get_collection("feedback").find({}).sort("createdAt", -1):
+        def fmt(v): return v.isoformat() if hasattr(v, "isoformat") else v or ""
+        ws.append([str(item.get("_id", "")), item.get("name", ""), item.get("email", ""), item.get("message", ""), item.get("status", ""), item.get("adminReply", ""), fmt(item.get("createdAt")), fmt(item.get("updatedAt"))])
+    buffer = io.BytesIO(); wb.save(buffer); buffer.seek(0); _log_action("export_feedback")
+    return send_file(buffer, mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", as_attachment=True, download_name="feedback.xlsx")
 
 
-# ============================================================
-# EXCEL IMPORT
-# ============================================================
-
-@admin_bp.route(
-    "/import",
-    methods=["POST", "OPTIONS"]
-)
+@admin_bp.route("/import", methods=["POST", "OPTIONS"])
 @admin_required
 def import_excel():
-    if request.method == "OPTIONS":
-        return _cors_response()
-
-    if "file" not in request.files:
-        return jsonify({
-            "error": "No file provided"
-        }), 400
-
+    if request.method == "OPTIONS": return _cors_response()
+    if "file" not in request.files: return jsonify({"error": "No file provided"}), 400
     file = request.files["file"]
-
-    if not file.filename:
-        return jsonify({
-            "error": "No file selected"
-        }), 400
-
-    if not file.filename.lower().endswith(
-        (".xlsx", ".xls")
-    ):
-        return jsonify({
-            "error": "Only Excel files are supported"
-        }), 400
-
-    try:
-        workbook = load_workbook(
-            file,
-            data_only=True
-        )
-    except Exception as exc:
-        return jsonify({
-            "error": "Failed to read Excel file",
-            "details": str(exc)
-        }), 500
-
+    if not file.filename: return jsonify({"error": "No file selected"}), 400
+    if not file.filename.lower().endswith(".xlsx"): return jsonify({"error": "Only .xlsx files are supported"}), 400
+    try: workbook = load_workbook(file, data_only=True)
+    except Exception as exc: return jsonify({"error": "Failed to read Excel file", "details": str(exc)}), 400
     try:
         from scripts.import_excel import import_workbook
-
         result = import_workbook(workbook)
-
     except Exception as exc:
-        return jsonify({
-            "error": "Excel import failed",
-            "details": str(exc)
-        }), 500
-
-    _log_action("import_excel", result)
-
-    return jsonify(result), 200
+        return jsonify({"error": "Excel import failed", "details": str(exc)}), 500
+    _log_action("import_excel", result); return jsonify(result), 200
 
 
-# ============================================================
-# AUDIT LOGS
-# ============================================================
-
-@admin_bp.route(
-    "/audit-logs",
-    methods=["GET", "OPTIONS"]
-)
+@admin_bp.route("/audit-logs", methods=["GET", "OPTIONS"])
 @admin_required
-def list_audit_logs():
+def audit_logs():
+    if request.method == "OPTIONS": return _cors_response()
+    page, limit = _pagination(); action = (request.args.get("action") or "").strip(); query = {"action": {"$regex": _safe_regex(action), "$options": "i"}} if action else {}
+    coll = get_collection("admin_audit_logs"); total = coll.count_documents(query); docs = list(coll.find(query).sort("createdAt", -1).skip((page-1)*limit).limit(limit))
+    return jsonify({"logs": serialize_doc(docs), "total": total, "page": page, "limit": limit, "totalPages": _pages(total, limit)}), 200
+
+# ------------------------- career-specific chapters ----------------------
+@admin_bp.route("/mappings/career-chapters/<career_id>", methods=["GET", "PUT", "OPTIONS"])
+@admin_required
+def career_chapter_mapping(career_id):
+    """Manage explicit Career_Chapter_Mapping rows from the current workbook schema."""
     if request.method == "OPTIONS":
         return _cors_response()
 
-    page, limit = _pagination()
-    logs_collection = get_collection("admin_audit_logs")
+    career = _find_ref("careers", career_id, ["_id", "career_id", "careerId"])
+    if not career:
+        return jsonify({"error": "Career not found"}), 404
 
-    query = {}
+    coll = get_collection("career_chapter_mapping")
+    career_refs = [value for value in (career.get("_id"), career.get("career_id"), career.get("careerId"), career_id) if value is not None]
+    query = _find_ref_many_query(career_refs, ["careerId", "career_id"])
 
-    action = (
-        request.args.get("action") or ""
-    ).strip()
+    if request.method == "GET":
+        mappings = list(coll.find(query).sort([("order", 1), ("_id", 1)]))
+        chapters, seen = [], set()
+        for mapping in mappings:
+            chapter_ref = _first(mapping, "chapterId", "chapter_id")
+            chapter = _find_ref("chapters", chapter_ref, ["_id", "chapter_id", "chapterId"]) if chapter_ref is not None else None
+            if chapter and str(chapter.get("_id")) not in seen:
+                chapters.append(chapter)
+                seen.add(str(chapter["_id"]))
+        return jsonify({"chapters": serialize_doc(chapters), "chapterIds": [str(chapter["_id"]) for chapter in chapters]}), 200
 
-    if action:
-        query["action"] = {
-            "$regex": action,
-            "$options": "i"
-        }
+    data = request.get_json(silent=True) or {}
+    chapter_ids = data.get("chapterIds", [])
+    if not isinstance(chapter_ids, list):
+        return jsonify({"error": "chapterIds must be an array"}), 400
 
-    total = logs_collection.count_documents(query)
+    resolved, invalid, seen = [], [], set()
+    for requested_id in chapter_ids:
+        chapter = _find_ref("chapters", requested_id, ["_id", "chapter_id", "chapterId"]) if requested_id is not None else None
+        if not chapter:
+            invalid.append(requested_id)
+            continue
+        key = str(chapter["_id"])
+        if key not in seen:
+            resolved.append(chapter)
+            seen.add(key)
 
-    logs = list(
-        logs_collection.find(query)
-        .sort("createdAt", -1)
-        .skip((page - 1) * limit)
-        .limit(limit)
-    )
+    if invalid:
+        return jsonify({"error": "One or more chapters were not found. No mappings were changed.", "invalidChapterIds": invalid}), 400
 
-    return jsonify({
-        "logs": serialize_doc(logs),
-        "total": total,
-        "page": page,
-        "limit": limit,
-        "totalPages": _total_pages(total, limit),
-    }), 200
+    old = list(coll.find(query, {"_id": 1}))
+    operations = [DeleteOne({"_id": row["_id"]}) for row in old]
+    now = now_utc()
+    operations.extend(InsertOne({
+        "careerId": career["_id"],
+        "chapterId": chapter["_id"],
+        "order": index,
+        "is_active": True,
+        "createdAt": now,
+        "updatedAt": now,
+    }) for index, chapter in enumerate(resolved, start=1))
+    if operations:
+        coll.bulk_write(operations, ordered=True)
+
+    _log_action("set_career_chapters", {"careerId": str(career["_id"]), "chapterCount": len(resolved)})
+    return jsonify({"success": True, "mapped": len(resolved), "chapterIds": [str(chapter["_id"]) for chapter in resolved]}), 200

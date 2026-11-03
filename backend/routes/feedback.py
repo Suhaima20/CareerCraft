@@ -2,7 +2,7 @@ from flask import Blueprint, request, jsonify, g
 from datetime import datetime, timezone
 
 from db import get_collection
-from utils.auth import token_required, decode_token
+from utils.auth import token_required, decode_token, is_account_active
 from utils.serialization import serialize_doc, to_objectid
 
 
@@ -59,7 +59,11 @@ def _get_user_from_token():
         })
 
         # Only treat normal users as logged-in users here.
-        if user and user.get("role", "user") == "user":
+        if (
+            user
+            and user.get("role", "user") == "user"
+            and is_account_active(user)
+        ):
             return user
 
         return None
